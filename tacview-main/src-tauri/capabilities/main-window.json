@@ -1,0 +1,12 @@
+{
+  "identifier": "main-window",
+  "description": "Capabilities for the main TAC_VIEW desktop window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "geolocation:allow-check-permissions",
+    "geolocation:allow-request-permissions",
+    "geolocation:allow-get-current-position",
+    "geolocation:allow-watch-position"
+  ]
+}

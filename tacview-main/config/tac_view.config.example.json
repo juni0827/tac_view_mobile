@@ -1,0 +1,13 @@
+{
+  "client": {
+    "googleApiKey": "",
+    "cesiumIonToken": ""
+  },
+  "server": {
+    "googleMapsApiKey": "",
+    "openskyClientId": "",
+    "openskyClientSecret": "",
+    "aisstreamApiKey": "",
+    "nswTransportApiKey": ""
+  }
+}

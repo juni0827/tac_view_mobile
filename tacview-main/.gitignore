@@ -1,0 +1,45 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist/
+dist-ssr
+*.local
+.sidecar-build/
+.tac_view-cache/
+src-tauri/target/
+src-tauri/binaries/
+src-tauri/gen/
+tac_view-dev.stdout.log
+tac_view-dev.stderr.log
+tauri-dev.stdout.log
+tauri-dev.stderr.log
+
+# Env files (contain API keys — NEVER commit these)
+.env
+.env.local
+.env.*.local
+server/.env
+server/.env.local
+
+# Credential files
+credentials.json
+*.pem
+*.key
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
