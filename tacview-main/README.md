@@ -23,8 +23,16 @@ TAC_VIEW is a desktop-first tactical intelligence globe built with `Tauri`, `Rea
 - Real-time globe layers for flights, ships, satellites, earthquakes, traffic, and CCTV
 - Selection-driven visual intelligence overlays
 - Predicted paths, destination candidates, relationship arcs, facility rings, and group hulls on the globe
+- Worker-backed tiered grouping for micro groups, meso groups, and altitude-gated activity clouds
+- Adaptive render budgets, camera query hysteresis, and Google 3D quality throttling for dense scenes
 - Local sidecar caching and snapshot reuse for faster cold starts
 - Desktop geolocation with fallback support
+
+## Architecture Highlights
+
+- `groupController` diffs live track inputs and streams only patches into a worker-backed grouping pipeline.
+- `renderBudget` and `renderQuery` scale layer density and prioritize tracked or related entities as the camera changes.
+- The desktop sidecar refuses direct standalone startup by default; the supported runtime contract is `tac_view.exe` launching the packaged sidecar.
 
 ## Development
 
@@ -44,6 +52,7 @@ npm install
 ### Configure
 
 Copy `config/tac_view.config.example.json` into your runtime config location and fill in the keys you actually use.
+Keep the example file as a placeholder template only; do not commit real API keys into it.
 
 Relevant keys:
 
@@ -54,20 +63,22 @@ Relevant keys:
 - `server.aisstreamApiKey`
 - `server.nswTransportApiKey`
 
-For local web-only dev, `.env` and `server/.env` still work.
+The packaged desktop flow reads runtime keys from `appData/tac_view/config.json`.
 
 ### Run
 
-```bash
-npm run dev
-npm run dev:server
-```
+There is no standalone local-web dev flow in this repository.
 
-Desktop run:
+Use the packaged desktop build path instead:
 
 ```bash
-npm run tauri:dev
+npm run tauri:build:win
 ```
+
+After the build finishes, the top-level outputs are:
+
+- `TAC_VIEW/` for the portable desktop run set
+- `TAC_VIEW_setup.exe` for the Windows installer
 
 ### Build
 
@@ -88,7 +99,8 @@ npm run test:e2e:desktop
 npm run test:smoke:desktop
 ```
 
-`test:smoke:desktop` launches the desktop app and checks that the sidecar and frontend boot sequence come up cleanly.
+`test:smoke:desktop` and `test:e2e:desktop` both validate the packaged desktop executable path.
+Unit coverage includes the tiered group engine, render-budget controller, and render-priority query helpers.
 
 ## Repository Layout
 
@@ -97,6 +109,8 @@ config/       Runtime config examples
 scripts/      Sidecar build and desktop smoke helpers
 server/       Express sidecar, runtime config, snapshot storage
 src/          React/Cesium application
+src/intelligence/ Tiered grouping engine, worker bridge, selection context
+src/lib/      Render safety, budget, priority query, performance stores
 src-tauri/    Tauri shell and desktop integration
 tests/        Unit, contract, and desktop smoke coverage
 ```
@@ -104,5 +118,7 @@ tests/        Unit, contract, and desktop smoke coverage
 ## Notes
 
 - This repository is now desktop-first. Old Vercel/serverless deployment artifacts have been removed.
+- Standalone local-web development entry points have been removed. The supported runtime is the packaged desktop app plus its local sidecar API.
 - Build output such as `dist/`, `.sidecar-build/`, `src-tauri/target/`, and packaged binaries is treated as generated state.
+- Temporary runtime snapshots and Playwright CLI logs are treated as generated local artifacts.
 - Missing API keys degrade features selectively rather than preventing the app from booting.

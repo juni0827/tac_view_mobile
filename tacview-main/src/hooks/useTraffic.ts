@@ -28,6 +28,7 @@ export function useTraffic(
   latitude: number,
   longitude: number,
   altitude: number,
+  reactUpdateMs = 120,
 ) {
   const [roads, setRoads] = useState<RoadSegment[]>([]);
   const [vehicles, setVehicles] = useState<TrafficVehicle[]>([]);
@@ -144,7 +145,6 @@ export function useTraffic(
 
     let lastFrameTime = performance.now();
     let lastReactUpdate = 0;
-    const reactUpdateMs = 200;
 
     const animate = (now: number) => {
       const deltaTime = (now - lastFrameTime) / 1000;
@@ -176,7 +176,7 @@ export function useTraffic(
         window.cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [enabled, roads, shouldFetchRoads]);
+  }, [enabled, reactUpdateMs, roads, shouldFetchRoads]);
 
   useEffect(() => {
     return () => {

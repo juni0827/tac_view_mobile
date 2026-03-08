@@ -161,6 +161,18 @@ async fn start_sidecar(app: tauri::AppHandle) -> Result<AppState, String> {
         .env("TAC_VIEW_AUTH_TOKEN", auth_token.clone())
         .env("TAC_VIEW_PORT", port.to_string());
 
+    let sidecar_command = if let Ok(snapshot_dir) = std::env::var("TAC_VIEW_SNAPSHOT_DIR") {
+        sidecar_command.env("TAC_VIEW_SNAPSHOT_DIR", snapshot_dir)
+    } else {
+        sidecar_command
+    };
+
+    let sidecar_command = if let Ok(fixture_profile) = std::env::var("TAC_VIEW_FIXTURE_PROFILE") {
+        sidecar_command.env("TAC_VIEW_FIXTURE_PROFILE", fixture_profile)
+    } else {
+        sidecar_command
+    };
+
     let (mut rx, child) = sidecar_command
         .spawn()
         .map_err(|error| format!("Failed to spawn sidecar: {error}"))?;

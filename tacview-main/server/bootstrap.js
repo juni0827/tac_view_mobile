@@ -1,6 +1,30 @@
 import path from 'node:path';
 import { server, runtimeConfig } from './app.js';
 
+function assertDesktopSidecarInvocation() {
+  if (process.env.TAC_VIEW_ALLOW_STANDALONE === '1') {
+    return;
+  }
+
+  const requiredEnvVars = [
+    'TAC_VIEW_PORT',
+    'TAC_VIEW_AUTH_TOKEN',
+    'TAC_VIEW_CONFIG_PATH',
+  ];
+  const missing = requiredEnvVars.filter((name) => {
+    const value = process.env[name];
+    return typeof value !== 'string' || value.trim().length === 0;
+  });
+
+  if (missing.length === 0) {
+    return;
+  }
+
+  throw new Error(
+    `tac_view-sidecar is not a standalone entry point. Launch tac_view.exe instead. Missing: ${missing.join(', ')}`,
+  );
+}
+
 export function startServer() {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -30,8 +54,14 @@ const isDirectRun = Boolean(process.pkg) || [
 ].includes(entryFileName);
 
 if (isDirectRun) {
-  startServer().catch((error) => {
+  try {
+    assertDesktopSidecarInvocation();
+    startServer().catch((error) => {
+      console.error('[TAC_VIEW] Failed to start server:', error);
+      process.exitCode = 1;
+    });
+  } catch (error) {
     console.error('[TAC_VIEW] Failed to start server:', error);
     process.exitCode = 1;
-  });
+  }
 }

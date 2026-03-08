@@ -12,9 +12,14 @@ dist/
 dist-ssr
 *.local
 .sidecar-build/
+.tauri-target/
 .tac_view-cache/
+.tmp-runtime-snapshots/
+.playwright-cli/
 src-tauri/target/
 src-tauri/binaries/
+TAC_VIEW/
+TAC_VIEW_setup.exe
 src-tauri/gen/
 tac_view-dev.stdout.log
 tac_view-dev.stderr.log

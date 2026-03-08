@@ -99,14 +99,15 @@ describe('visual intelligence engine', () => {
   it('detects co-movement groups for nearby flights', () => {
     const flights = [
       makeFlight({ icao24: 'group-a', callsign: 'GROUP01', latitude: 37.62, longitude: -122.38, heading: 92 }),
-      makeFlight({ icao24: 'group-b', callsign: 'GROUP02', latitude: 37.67, longitude: -122.2, heading: 95 }),
+      makeFlight({ icao24: 'group-b', callsign: 'GROUP02', latitude: 37.66, longitude: -122.33, heading: 95 }),
     ];
 
     const groups = detectGroups(flights, [], [makeCamera()]);
 
     expect(groups).toHaveLength(1);
     expect(groups[0]?.memberIds).toEqual(expect.arrayContaining(['flight-group-a', 'flight-group-b']));
-    expect(groups[0]?.predictedPaths).toHaveLength(3);
+    expect(groups[0]?.label).toContain('MICRO AIR');
+    expect(groups[0]?.confidence).toBeGreaterThan(0);
   });
 
   it('builds top-3 predicted paths and ontology overlays for a selected aircraft', () => {
@@ -115,8 +116,8 @@ describe('visual intelligence engine', () => {
       makeFlight({
         icao24: 'peer-1',
         callsign: 'PEER1',
-        latitude: 37.72,
-        longitude: -122.08,
+        latitude: 37.66,
+        longitude: -122.33,
         heading: 97,
         originAirport: 'SFO',
         destAirport: 'LAX',
@@ -143,6 +144,7 @@ describe('visual intelligence engine', () => {
     expect(state.selectionContext?.altitudeStem).not.toBeNull();
     expect(state.selectionContext?.relationships.length).toBeGreaterThan(0);
     expect(state.selectionContext?.relatedEntities.some((entity) => entity.id === 'flight-peer-1')).toBe(true);
+    expect(state.stats.microCount).toBeGreaterThanOrEqual(1);
   });
 
   it('builds satellite coverage overlays and linked facilities for a selected satellite', () => {

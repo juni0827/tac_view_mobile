@@ -9,6 +9,10 @@ export default defineConfig([
   globalIgnores([
     'dist',
     '.sidecar-build',
+    '.tauri-target',
+    '.playwright-cli',
+    '.tmp-runtime-snapshots',
+    'TAC_VIEW',
     'src-tauri/target',
   ]),
   {

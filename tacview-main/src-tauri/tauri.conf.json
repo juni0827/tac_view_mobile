@@ -5,8 +5,6 @@
   "identifier": "com.tacview.desktop",
   "build": {
     "beforeBuildCommand": "npm run build:sidecar && npm run build",
-    "beforeDevCommand": "npm run build:sidecar && npm run dev",
-    "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
   "app": {

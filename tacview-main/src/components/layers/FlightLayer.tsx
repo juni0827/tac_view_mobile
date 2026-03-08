@@ -1,110 +1,49 @@
-/**
- * FlightLayer — High-performance imperative rendering using Cesium Primitive Collections.
- *
- * Instead of creating ~27,000 React <Entity> components (which caused complete UI freeze),
- * this uses BillboardCollection, LabelCollection, and PolylineCollection to batch
- * all aircraft into just a few GPU-friendly collections. This architecture is proven to
- * handle 100,000+ objects efficiently.
- *
- * Key decisions:
- * - Imperative API via useCesium() + useEffect — bypasses React reconciliation entirely
- * - removeAll() + bulk add() on each data refresh (recommended by Cesium docs)
- * - Route lines use great-circle (slerp) interpolation for proper curved arcs
- * - Labels use distanceDisplayCondition to hide when zoomed far out
- * - BillboardCollection renders aircraft icons rotated by heading
- * - disableDepthTestDistance: 0 on all labels/billboards for proper globe occlusion
- * - Each billboard gets an `id` property (backing Entity) for scene.pick() + trackedEntity
- */
 import { useEffect, useRef } from 'react';
 import { useCesium } from 'resium';
 import {
-  Cartesian3,
-  Color,
-  NearFarScalar,
-  DistanceDisplayCondition,
   Billboard,
-  Label,
   BillboardCollection,
-  LabelCollection,
-  PolylineCollection,
   BlendOption,
-  VerticalOrigin,
-  HorizontalOrigin,
-  Cartesian2 as CesiumCartesian2,
-  LabelStyle,
-  Entity as CesiumEntity,
   CallbackProperty,
-  ConstantProperty,
-  Math as CesiumMath,
-  Material,
+  Cartesian2 as CesiumCartesian2,
+  Cartesian3,
   Cartographic,
+  Color,
+  ConstantProperty,
+  DistanceDisplayCondition,
   Ellipsoid,
   EllipsoidGeodesic,
+  Entity as CesiumEntity,
+  HorizontalOrigin,
+  Label,
+  LabelCollection,
+  LabelStyle,
+  Material,
+  Math as CesiumMath,
+  NearFarScalar,
+  Polyline,
+  PolylineCollection,
+  VerticalOrigin,
 } from 'cesium';
 import * as Cesium from 'cesium';
-
-// EllipsoidalOccluder exists at runtime but is missing from Cesium's TS declarations
-const EllipsoidalOccluder = (Cesium as unknown as { EllipsoidalOccluder: new (
-  ellipsoid: typeof Ellipsoid.WGS84,
-  cameraPosition: Cartesian3,
-) => { isPointVisible(point: Cartesian3): boolean } }).EllipsoidalOccluder;
 import type { Flight } from '../../hooks/useFlights';
 import { getAirportCoords } from '../../data/airports';
+import { recordLayerPerformance } from '../../lib/performanceStore';
+import {
+  isRenderableAltitude,
+  isRenderableLatitude,
+  isRenderableLongitude,
+  normalizeLongitude,
+} from '../../lib/cesiumSafety';
 import type { AltitudeBand } from './flightLayerUtils';
 import { getAltitudeBand } from './flightLayerUtils';
 
-/* ─── aircraft icon canvas ─────────────────────────────────────── */
-
-/** Create a white aircraft silhouette on a transparent canvas (32x32).
- *  Drawn pointing UP (north). Billboard.rotation rotates it to heading. */
-function createAircraftIcon(): HTMLCanvasElement {
-  const S = 32;
-  const canvas = document.createElement('canvas');
-  canvas.width = S;
-  canvas.height = S;
-  const c = canvas.getContext('2d')!;
-  const cx = S / 2;
-
-  c.fillStyle = '#FFFFFF';
-  c.beginPath();
-  // Nose
-  c.moveTo(cx, 2);
-  // Right fuselage → right wing
-  c.lineTo(cx + 3, 10);
-  c.lineTo(cx + 13, 16);
-  c.lineTo(cx + 13, 17);
-  c.lineTo(cx + 3, 14);
-  // Right tail
-  c.lineTo(cx + 3, 22);
-  c.lineTo(cx + 7, 27);
-  c.lineTo(cx + 7, 28);
-  c.lineTo(cx + 1, 25);
-  // Centre tail
-  c.lineTo(cx, 27);
-  // Left tail
-  c.lineTo(cx - 1, 25);
-  c.lineTo(cx - 7, 28);
-  c.lineTo(cx - 7, 27);
-  c.lineTo(cx - 3, 22);
-  // Left fuselage → left wing
-  c.lineTo(cx - 3, 14);
-  c.lineTo(cx - 13, 17);
-  c.lineTo(cx - 13, 16);
-  c.lineTo(cx - 3, 10);
-  c.closePath();
-  c.fill();
-
-  return canvas;
-}
-
-/** Lazily-created singleton aircraft icon canvas */
-let _aircraftIcon: HTMLCanvasElement | null = null;
-function getAircraftIcon(): HTMLCanvasElement {
-  if (!_aircraftIcon) _aircraftIcon = createAircraftIcon();
-  return _aircraftIcon;
-}
-
-/** Altitude band keys — matches the colour coding */
+const EllipsoidalOccluder = (Cesium as unknown as {
+  EllipsoidalOccluder: new (
+    ellipsoid: typeof Ellipsoid.WGS84,
+    cameraPosition: Cartesian3,
+  ) => { isPointVisible(point: Cartesian3): boolean };
+}).EllipsoidalOccluder;
 
 export interface FlightLayerProps {
   flights: Flight[];
@@ -114,121 +53,193 @@ export interface FlightLayerProps {
   isTracking: boolean;
 }
 
-/* ─── altitude band classification ────────────────────────────────── */
+interface FlightState {
+  lat: number;
+  lon: number;
+  alt: number;
+  heading: number | null;
+  speed: number | null;
+  updatedAt: number;
+}
 
+interface FlightPrimitiveRefs {
+  billboard: Billboard;
+  label: Label;
+}
 
-/* ─── colour / size helpers ───────────────────────────────────────── */
+interface RoutePrimitiveRefs {
+  completed?: Polyline;
+  remaining?: Polyline;
+}
 
-function getAltitudeColor(altFeet: number): Color {
-  if (altFeet >= 35_000) return Color.fromCssColorString('#00D4FF');
-  if (altFeet >= 20_000) return Color.fromCssColorString('#00BFFF');
-  if (altFeet >= 10_000) return Color.fromCssColorString('#FFD700');
-  if (altFeet >= 3_000) return Color.fromCssColorString('#FF8C00');
+function createAircraftIcon() {
+  const size = 32;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return canvas;
+  }
+
+  const centerX = size / 2;
+  context.fillStyle = '#FFFFFF';
+  context.beginPath();
+  context.moveTo(centerX, 2);
+  context.lineTo(centerX + 3, 10);
+  context.lineTo(centerX + 13, 16);
+  context.lineTo(centerX + 13, 17);
+  context.lineTo(centerX + 3, 14);
+  context.lineTo(centerX + 3, 22);
+  context.lineTo(centerX + 7, 27);
+  context.lineTo(centerX + 7, 28);
+  context.lineTo(centerX + 1, 25);
+  context.lineTo(centerX, 27);
+  context.lineTo(centerX - 1, 25);
+  context.lineTo(centerX - 7, 28);
+  context.lineTo(centerX - 7, 27);
+  context.lineTo(centerX - 3, 22);
+  context.lineTo(centerX - 3, 14);
+  context.lineTo(centerX - 13, 17);
+  context.lineTo(centerX - 13, 16);
+  context.lineTo(centerX - 3, 10);
+  context.closePath();
+  context.fill();
+
+  return canvas;
+}
+
+let aircraftIcon: HTMLCanvasElement | null = null;
+function getAircraftIcon() {
+  if (!aircraftIcon) {
+    aircraftIcon = createAircraftIcon();
+  }
+  return aircraftIcon;
+}
+
+function getAltitudeColor(altitudeFeet: number) {
+  if (altitudeFeet >= 35_000) return Color.fromCssColorString('#00D4FF');
+  if (altitudeFeet >= 20_000) return Color.fromCssColorString('#00BFFF');
+  if (altitudeFeet >= 10_000) return Color.fromCssColorString('#FFD700');
+  if (altitudeFeet >= 3_000) return Color.fromCssColorString('#FF8C00');
   return Color.fromCssColorString('#FF4444');
 }
 
-/** Billboard scale by altitude — larger icons for higher aircraft */
-function getAltitudeScale(altFeet: number): number {
-  if (altFeet >= 30_000) return 0.45;
-  if (altFeet >= 15_000) return 0.38;
+function getAltitudeScale(altitudeFeet: number) {
+  if (altitudeFeet >= 30_000) return 0.45;
+  if (altitudeFeet >= 15_000) return 0.38;
   return 0.3;
 }
 
-/** Scale applied to the tracked (selected) aircraft billboard — ~32 px on screen */
-const TRACKED_SCALE = 1.0;
-
-/* ─── great-circle route line builder ─────────────────────────────── */
-
-const ROUTE_ALT = 11_000;
-const SEGMENTS = 12;
-
-/**
- * Build positions along a great-circle arc between two geographic points,
- * with a smooth altitude curve. Uses EllipsoidGeodesic for accurate
- * geodesic interpolation — avoids the straight-line-through-globe artefact
- * that linear lat/lon interpolation produces on a 3D globe.
- */
-function buildRoutePositions(
-  fromLat: number, fromLon: number,
-  toLat: number, toLon: number,
-  altStart: number, altEnd: number,
-  curveUp: boolean,
-): Cartesian3[] {
-  const start = Cartographic.fromDegrees(fromLon, fromLat);
-  const end = Cartographic.fromDegrees(toLon, toLat);
-  const geodesic = new EllipsoidGeodesic(start, end, Ellipsoid.WGS84);
-  const pts: Cartesian3[] = [];
-
-  for (let i = 0; i <= SEGMENTS; i++) {
-    const t = i / SEGMENTS;
-    const carto = geodesic.interpolateUsingFraction(t);
-    const alt = curveUp
-      ? ROUTE_ALT * Math.sin(t * Math.PI * 0.5) + 500
-      : ROUTE_ALT * Math.cos(t * Math.PI * 0.5) + 500;
-    const finalAlt = i === 0 ? altStart : i === SEGMENTS ? altEnd : alt;
-    carto.height = finalAlt;
-    pts.push(Ellipsoid.WGS84.cartographicToCartesian(carto));
-  }
-  return pts;
-}
-
-/* ─── palette caching ─────────────────────────────────────────────── */
-
-const ROUTE_COMPLETED_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.18);
-const ROUTE_REMAINING_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.35);
-const TRAIL_ALPHA = 0.4;
-const LABEL_OFFSET = new CesiumCartesian2(10, -4);
-
-/* ─── build description HTML for info panel ───────────────────────── */
-
-function buildFlightDescription(f: Flight): string {
+function buildFlightDescription(flight: Flight) {
   return `
-    <p><b>Callsign:</b> ${f.callsign || 'N/A'}</p>
-    <p><b>Registration:</b> ${f.registration || 'N/A'}</p>
-    <p><b>Aircraft:</b> ${f.description || f.aircraftType || 'Unknown'}</p>
-    <p><b>Operator:</b> ${f.operator || f.airline || 'N/A'}</p>
-    <p><b>Route:</b> ${f.originAirport || '?'} → ${f.destAirport || '?'}</p>
-    <p><b>Altitude:</b> ${f.altitudeFeet.toLocaleString()} ft (${Math.round(f.altitude).toLocaleString()} m)</p>
-    <p><b>Speed:</b> ${f.velocityKnots ?? 'N/A'} kt</p>
-    <p><b>Heading:</b> ${f.heading != null ? Math.round(f.heading) + '°' : 'N/A'}</p>
-    <p><b>Squawk:</b> ${f.squawk || 'N/A'}</p>
-    <p><b>ICAO24:</b> ${f.icao24}</p>
+    <p><b>Callsign:</b> ${flight.callsign || 'N/A'}</p>
+    <p><b>Registration:</b> ${flight.registration || 'N/A'}</p>
+    <p><b>Aircraft:</b> ${flight.description || flight.aircraftType || 'Unknown'}</p>
+    <p><b>Operator:</b> ${flight.operator || flight.airline || 'N/A'}</p>
+    <p><b>Route:</b> ${flight.originAirport || '?'} -> ${flight.destAirport || '?'}</p>
+    <p><b>Altitude:</b> ${flight.altitudeFeet.toLocaleString()} ft (${Math.round(flight.altitude).toLocaleString()} m)</p>
+    <p><b>Speed:</b> ${flight.velocityKnots ?? 'N/A'} kt</p>
+    <p><b>Heading:</b> ${flight.heading != null ? `${Math.round(flight.heading)} deg` : 'N/A'}</p>
+    <p><b>Squawk:</b> ${flight.squawk || 'N/A'}</p>
+    <p><b>ICAO24:</b> ${flight.icao24}</p>
   `;
 }
 
-/* ═══════════════════════════════════════════════════════════════════ */
+const ROUTE_ALTITUDE = 11_000;
+const ROUTE_SEGMENTS = 12;
+const ROUTE_COMPLETED_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.18);
+const ROUTE_REMAINING_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.35);
+const LABEL_OFFSET = new CesiumCartesian2(10, -4);
+const TRAIL_ALPHA = 0.4;
+const TRACKED_SCALE = 1.0;
 
-export default function FlightLayer({ flights, visible, showPaths, altitudeFilter, isTracking }: FlightLayerProps) {
+function buildRoutePositions(
+  fromLat: number,
+  fromLon: number,
+  toLat: number,
+  toLon: number,
+  altitudeStart: number,
+  altitudeEnd: number,
+  curveUp: boolean,
+) {
+  if (
+    !isRenderableLatitude(fromLat) ||
+    !isRenderableLongitude(fromLon) ||
+    !isRenderableLatitude(toLat) ||
+    !isRenderableLongitude(toLon)
+  ) {
+    return [] as Cartesian3[];
+  }
+
+  const start = Cartographic.fromDegrees(fromLon, fromLat);
+  const end = Cartographic.fromDegrees(toLon, toLat);
+  const geodesic = new EllipsoidGeodesic(start, end, Ellipsoid.WGS84);
+  const positions: Cartesian3[] = [];
+
+  for (let index = 0; index <= ROUTE_SEGMENTS; index += 1) {
+    const fraction = index / ROUTE_SEGMENTS;
+    const cartographic = geodesic.interpolateUsingFraction(fraction);
+    const arcAltitude = curveUp
+      ? ROUTE_ALTITUDE * Math.sin(fraction * Math.PI * 0.5) + 500
+      : ROUTE_ALTITUDE * Math.cos(fraction * Math.PI * 0.5) + 500;
+    cartographic.height = index === 0
+      ? altitudeStart
+      : index === ROUTE_SEGMENTS
+        ? altitudeEnd
+        : arcAltitude;
+    positions.push(Ellipsoid.WGS84.cartographicToCartesian(cartographic));
+  }
+
+  return positions;
+}
+
+function buildTrailPositions(flight: Flight, position: Cartesian3) {
+  if (flight.heading == null || flight.velocityKnots == null || flight.velocityKnots < 50) {
+    return null;
+  }
+
+  const trailLengthDegrees = 0.15;
+  const headingRadians = CesiumMath.toRadians(flight.heading);
+  const trailLat = flight.latitude - Math.cos(headingRadians) * trailLengthDegrees;
+  const trailLon = normalizeLongitude(flight.longitude - Math.sin(headingRadians) * trailLengthDegrees);
+
+  if (!isRenderableLatitude(trailLat) || !isRenderableLongitude(trailLon)) {
+    return null;
+  }
+
+  return [
+    Cartesian3.fromDegrees(trailLon, trailLat, flight.altitude),
+    position,
+  ];
+}
+
+export default function FlightLayer({
+  flights,
+  visible,
+  showPaths,
+  altitudeFilter,
+  isTracking,
+}: FlightLayerProps) {
   const { viewer } = useCesium();
-
-  // Map of icao24 → backing CesiumEntity for tracked-entity camera follow.
   const entityMapRef = useRef<Map<string, CesiumEntity>>(new Map());
-
-  // Map of icao24 → current dead-reckoned Cartesian3 position.
-  // CallbackProperty reads from this map every frame for smooth camera tracking.
   const positionMapRef = useRef<Map<string, Cartesian3>>(new Map());
-
-  // Mutable flight state for dead-reckoning interpolation between data refreshes.
-  const flightStateRef = useRef<Map<string, {
-    lat: number; lon: number; alt: number;
-    heading: number | null; speed: number | null;
-    updatedAt: number;
-  }>>(new Map());
-
-  // Persistent primitive collection refs — survive across data refreshes
+  const flightStateRef = useRef<Map<string, FlightState>>(new Map());
   const collectionsRef = useRef<{
     billboards: BillboardCollection;
     labels: LabelCollection;
     trails: PolylineCollection;
     routes: PolylineCollection;
   } | null>(null);
+  const primitiveMapRef = useRef<Map<string, FlightPrimitiveRefs>>(new Map());
+  const trailMapRef = useRef<Map<string, Polyline>>(new Map());
+  const routeMapRef = useRef<Map<string, RoutePrimitiveRefs>>(new Map());
+  const lastOcclusionUpdateRef = useRef(0);
 
-  // Map of icao24 → individual primitive refs for incremental position updates
-  const primitiveMapRef = useRef<Map<string, { billboard: Billboard; label: Label }>>(new Map());
-
-  /* ── Effect 1: Create / destroy primitive collections (viewer lifecycle) ── */
   useEffect(() => {
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     const billboards = new BillboardCollection();
     const labels = new LabelCollection({ blendOption: BlendOption.TRANSLUCENT });
@@ -243,130 +254,131 @@ export default function FlightLayer({ flights, visible, showPaths, altitudeFilte
     collectionsRef.current = { billboards, labels, trails, routes };
 
     return () => {
-      try {
-        if (!viewer.isDestroyed()) {
-          try { viewer.scene.primitives.remove(billboards); } catch { /* ok */ }
-          try { viewer.scene.primitives.remove(labels); } catch { /* ok */ }
-          try { viewer.scene.primitives.remove(trails); } catch { /* ok */ }
-          try { viewer.scene.primitives.remove(routes); } catch { /* ok */ }
-        }
-      } catch { /* viewer may be destroyed during HMR */ }
+      if (!viewer.isDestroyed()) {
+        viewer.scene.primitives.remove(billboards);
+        viewer.scene.primitives.remove(labels);
+        viewer.scene.primitives.remove(trails);
+        viewer.scene.primitives.remove(routes);
+        entityMapRef.current.forEach((entity) => {
+          try {
+            viewer.entities.remove(entity);
+          } catch {
+            // Best-effort cleanup.
+          }
+        });
+      }
+
       collectionsRef.current = null;
       primitiveMapRef.current.clear();
+      trailMapRef.current.clear();
+      routeMapRef.current.clear();
+      entityMapRef.current.clear();
+      positionMapRef.current.clear();
+      flightStateRef.current.clear();
     };
   }, [viewer]);
 
-  /* ── Effect 2: Sync flight data into primitives (incremental updates) ── */
   useEffect(() => {
-    const cols = collectionsRef.current;
-    let viewerOk = false;
-    try { viewerOk = !!viewer && !viewer.isDestroyed(); } catch { /* */ }
-    if (!viewerOk || !cols) return;
-
-    // Guard: if any collection was already destroyed (HMR / strict mode), bail out
-    // Hide trail/route collections during rebuild to prevent Cesium rendering
-    // partially-updated polylines (avoids material undefined crash)
-    try {
-      cols.trails.show = false;
-      cols.routes.show = false;
-      cols.trails.removeAll();
-      cols.routes.removeAll();
-    } catch {
-      // Collections were destroyed — nothing we can do
+    const collections = collectionsRef.current;
+    if (!viewer || viewer.isDestroyed() || !collections) {
       return;
     }
 
+    const startedAt = performance.now();
+
     if (!visible || flights.length === 0) {
-      try {
-        cols.billboards.removeAll();
-        cols.labels.removeAll();
-      } catch { /* destroyed */ }
+      collections.billboards.removeAll();
+      collections.labels.removeAll();
+      collections.trails.removeAll();
+      collections.routes.removeAll();
       primitiveMapRef.current.clear();
+      trailMapRef.current.clear();
+      routeMapRef.current.clear();
+      recordLayerPerformance('flights', {
+        updateMs: performance.now() - startedAt,
+        primitives: 0,
+        visibleCount: 0,
+      });
       return;
     }
 
     const activeIcaos = new Set<string>();
 
-    for (const f of flights) {
-      const band = getAltitudeBand(f.altitudeFeet);
-      if (!altitudeFilter[band]) continue;
+    for (const flight of flights) {
+      if (
+        !isRenderableLatitude(flight.latitude) ||
+        !isRenderableLongitude(flight.longitude) ||
+        !isRenderableAltitude(flight.altitude, { min: 0, max: 100_000 })
+      ) {
+        continue;
+      }
 
-      const color = getAltitudeColor(f.altitudeFeet);
-      const scale = getAltitudeScale(f.altitudeFeet);
-      const position = Cartesian3.fromDegrees(f.longitude, f.latitude, f.altitude);
-      const rotation = f.heading != null ? -CesiumMath.toRadians(f.heading) : 0;
+      const altitudeBand = getAltitudeBand(flight.altitudeFeet);
+      if (!altitudeFilter[altitudeBand]) {
+        continue;
+      }
 
-      const callLabel = f.callsign || f.registration || f.icao24;
-      const altLabel = f.altitudeFeet > 0 ? `FL${Math.round(f.altitudeFeet / 100)}` : 'GND';
-      const speedLabel = f.velocityKnots != null ? `${Math.round(f.velocityKnots)}kt` : '';
-      const typeLabel = f.aircraftType || '';
-      const routeLabel = f.originAirport && f.destAirport
-        ? `${f.originAirport}\u2192${f.destAirport}` : '';
-      const fullLabel = `${callLabel} ${altLabel} ${speedLabel} ${typeLabel} ${routeLabel}`.trim();
+      activeIcaos.add(flight.icao24);
 
-      activeIcaos.add(f.icao24);
-
-      // Update dead-reckoning state
-      flightStateRef.current.set(f.icao24, {
-        lat: f.latitude, lon: f.longitude, alt: f.altitude,
-        heading: f.heading ?? null, speed: f.velocityKnots ?? null,
+      const position = Cartesian3.fromDegrees(normalizeLongitude(flight.longitude), flight.latitude, flight.altitude);
+      positionMapRef.current.set(flight.icao24, position);
+      flightStateRef.current.set(flight.icao24, {
+        lat: flight.latitude,
+        lon: flight.longitude,
+        alt: flight.altitude,
+        heading: flight.heading ?? null,
+        speed: flight.velocityKnots ?? null,
         updatedAt: Date.now(),
       });
 
-      // Backing entity for tracked-entity camera follow.
-      // Uses CallbackProperty (isConstant=false) so Cesium re-evaluates
-      // the position every frame — identical to how SatelliteLayer works.
-      positionMapRef.current.set(f.icao24, position);
+      const color = getAltitudeColor(flight.altitudeFeet);
+      const scale = getAltitudeScale(flight.altitudeFeet);
+      const rotation = flight.heading != null ? -CesiumMath.toRadians(flight.heading) : 0;
+      const callLabel = flight.callsign || flight.registration || flight.icao24;
+      const altLabel = flight.altitudeFeet > 0 ? `FL${Math.round(flight.altitudeFeet / 100)}` : 'GND';
+      const speedLabel = flight.velocityKnots != null ? `${Math.round(flight.velocityKnots)}kt` : '';
+      const typeLabel = flight.aircraftType || '';
+      const routeLabel = flight.originAirport && flight.destAirport
+        ? `${flight.originAirport}->${flight.destAirport}`
+        : '';
+      const labelText = `${callLabel} ${altLabel} ${speedLabel} ${typeLabel} ${routeLabel}`.trim();
 
-      let backingEntity = entityMapRef.current.get(f.icao24);
+      let backingEntity = entityMapRef.current.get(flight.icao24);
       if (!backingEntity) {
-        // Guard: viewer may have been destroyed between loop iterations (HMR / strict mode)
-        try { if (viewer!.isDestroyed()) break; } catch { break; }
-
-        const icao = f.icao24; // capture for closure
+        const icao = flight.icao24;
         backingEntity = new CesiumEntity({
-          id: `flight-${f.icao24}`,
+          id: `flight-${flight.icao24}`,
           name: callLabel,
           position: new CallbackProperty(
             () => positionMapRef.current.get(icao) ?? position,
-            false, // isConstant=false → Cesium re-reads every frame
+            false,
           ) as unknown as never,
-          description: new ConstantProperty(buildFlightDescription(f)),
-          // A tiny transparent point is required so Cesium's PointVisualiser can
-          // compute a bounding sphere for this entity. Without graphics,
-          // DataSourceDisplay.getBoundingSphere returns FAILED and trackedEntity
-          // camera follow never engages (EntityView is never created).
+          description: new ConstantProperty(buildFlightDescription(flight)),
           point: {
             pixelSize: 1,
             color: Color.TRANSPARENT,
           },
         });
-        try {
-          viewer!.entities.add(backingEntity);
-        } catch {
-          // Viewer destroyed mid-loop — stop processing
-          break;
-        }
-        entityMapRef.current.set(f.icao24, backingEntity);
+        viewer.entities.add(backingEntity);
+        entityMapRef.current.set(flight.icao24, backingEntity);
       } else {
         backingEntity.name = callLabel;
-        try {
-          (backingEntity.description as ConstantProperty).setValue(buildFlightDescription(f));
-        } catch { /* entity may be destroyed */ }
+        (backingEntity.description as ConstantProperty).setValue(buildFlightDescription(flight));
       }
 
-      // Billboard + Label: create or update in-place
-      const existing = primitiveMapRef.current.get(f.icao24);
+      const existing = primitiveMapRef.current.get(flight.icao24);
       if (existing) {
         existing.billboard.position = position;
         existing.billboard.color = color;
         existing.billboard.scale = scale;
         existing.billboard.rotation = rotation;
+        existing.billboard.id = backingEntity;
         existing.label.position = position;
-        existing.label.text = fullLabel;
+        existing.label.text = labelText;
         existing.label.fillColor = color.withAlpha(0.85);
+        existing.label.id = backingEntity;
       } else {
-        const billboard = cols.billboards.add({
+        const billboard = collections.billboards.add({
           position,
           image: getAircraftIcon(),
           color,
@@ -379,9 +391,9 @@ export default function FlightLayer({ flights, visible, showPaths, altitudeFilte
           disableDepthTestDistance: 0,
           id: backingEntity,
         });
-        const label = cols.labels.add({
+        const label = collections.labels.add({
           position,
-          text: fullLabel,
+          text: labelText,
           font: '8px monospace',
           fillColor: color.withAlpha(0.85),
           outlineColor: Color.BLACK,
@@ -394,261 +406,295 @@ export default function FlightLayer({ flights, visible, showPaths, altitudeFilte
           disableDepthTestDistance: 0,
           id: backingEntity,
         });
-        primitiveMapRef.current.set(f.icao24, { billboard, label });
+        primitiveMapRef.current.set(flight.icao24, { billboard, label });
       }
 
-      // Far-side occlusion — hide entities behind the globe
-      if (viewer) {
-        const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
-        const vis = occluder.isPointVisible(position);
-        const prims = primitiveMapRef.current.get(f.icao24);
-        if (prims) {
-          prims.billboard.show = vis;
-          prims.label.show = vis && !isTracking;
+      const trailPositions = buildTrailPositions(flight, position);
+      const trail = trailMapRef.current.get(flight.icao24);
+      if (trailPositions) {
+        if (trail) {
+          trail.positions = trailPositions;
+          trail.show = true;
+        } else {
+          trailMapRef.current.set(
+            flight.icao24,
+            collections.trails.add({
+              positions: trailPositions,
+              width: 1.5,
+              material: Material.fromType('Color', { color: color.withAlpha(TRAIL_ALPHA) }),
+            }),
+          );
         }
+      } else if (trail) {
+        collections.trails.remove(trail);
+        trailMapRef.current.delete(flight.icao24);
       }
 
-      // Heading trail (rebuilt each refresh)
-      if (f.heading != null && f.velocityKnots != null && f.velocityKnots >= 50) {
-        try {
-          const trailLenDeg = 0.15;
-          const headingRad = CesiumMath.toRadians(f.heading);
-          const dLat = -Math.cos(headingRad) * trailLenDeg;
-          const dLon = -Math.sin(headingRad) * trailLenDeg;
-          cols.trails.add({
-            positions: [
-              Cartesian3.fromDegrees(f.longitude + dLon, f.latitude + dLat, f.altitude),
-              position,
-            ],
-            width: 1.5,
-            material: Material.fromType('Color', { color: color.withAlpha(TRAIL_ALPHA) }),
-          });
-        } catch { /* skip bad trail polyline */ }
-      }
-
-      // Route lines (great-circle arcs) — each polyline gets its own Material
-      // instance to avoid Cesium bucket corruption when the collection is rebuilt
+      const existingRoutes = routeMapRef.current.get(flight.icao24) ?? {};
       if (showPaths) {
-        const origin = getAirportCoords(f.originAirport);
-        const dest = getAirportCoords(f.destAirport);
+        const origin = getAirportCoords(flight.originAirport);
+        const destination = getAirportCoords(flight.destAirport);
 
         if (origin) {
-          try {
-            cols.routes.add({
-              positions: buildRoutePositions(
-                origin.lat, origin.lon,
-                f.latitude, f.longitude,
-                500, f.altitude, true,
-              ),
-              width: 1,
-              material: Material.fromType('Color', { color: ROUTE_COMPLETED_COLOR }),
-            });
-          } catch { /* skip bad route polyline */ }
+          const completedPositions = buildRoutePositions(
+            origin.lat,
+            origin.lon,
+            flight.latitude,
+            flight.longitude,
+            500,
+            flight.altitude,
+            true,
+          );
+          if (completedPositions.length >= 2) {
+            if (existingRoutes.completed) {
+              existingRoutes.completed.positions = completedPositions;
+              existingRoutes.completed.show = true;
+            } else {
+              existingRoutes.completed = collections.routes.add({
+                positions: completedPositions,
+                width: 1,
+                material: Material.fromType('Color', { color: ROUTE_COMPLETED_COLOR }),
+              });
+            }
+          }
+        } else if (existingRoutes.completed) {
+          collections.routes.remove(existingRoutes.completed);
+          delete existingRoutes.completed;
         }
 
-        if (dest) {
-          try {
-            cols.routes.add({
-              positions: buildRoutePositions(
-                f.latitude, f.longitude,
-                dest.lat, dest.lon,
-                f.altitude, 500, false,
-              ),
-              width: 1.5,
-              material: Material.fromType('Color', { color: ROUTE_REMAINING_COLOR }),
-            });
-          } catch { /* skip bad route polyline */ }
+        if (destination) {
+          const remainingPositions = buildRoutePositions(
+            flight.latitude,
+            flight.longitude,
+            destination.lat,
+            destination.lon,
+            flight.altitude,
+            500,
+            false,
+          );
+          if (remainingPositions.length >= 2) {
+            if (existingRoutes.remaining) {
+              existingRoutes.remaining.positions = remainingPositions;
+              existingRoutes.remaining.show = true;
+            } else {
+              existingRoutes.remaining = collections.routes.add({
+                positions: remainingPositions,
+                width: 1.5,
+                material: Material.fromType('Color', { color: ROUTE_REMAINING_COLOR }),
+              });
+            }
+          }
+        } else if (existingRoutes.remaining) {
+          collections.routes.remove(existingRoutes.remaining);
+          delete existingRoutes.remaining;
         }
+
+        routeMapRef.current.set(flight.icao24, existingRoutes);
+      } else {
+        if (existingRoutes.completed) {
+          collections.routes.remove(existingRoutes.completed);
+        }
+        if (existingRoutes.remaining) {
+          collections.routes.remove(existingRoutes.remaining);
+        }
+        routeMapRef.current.delete(flight.icao24);
       }
     }
 
-    // Remove stale primitives
-    for (const [icao, prims] of primitiveMapRef.current) {
+    for (const [icao, primitives] of primitiveMapRef.current) {
       if (!activeIcaos.has(icao)) {
-        try { cols.billboards.remove(prims.billboard); } catch { /* ok */ }
-        try { cols.labels.remove(prims.label); } catch { /* ok */ }
+        collections.billboards.remove(primitives.billboard);
+        collections.labels.remove(primitives.label);
         primitiveMapRef.current.delete(icao);
       }
     }
 
-    // Prune backing entities (never prune tracked)
-    entityMapRef.current.forEach((entity, icao) => {
+    for (const [icao, trail] of trailMapRef.current) {
       if (!activeIcaos.has(icao)) {
-        try {
-          if (viewer!.trackedEntity !== entity) {
-            viewer!.entities.remove(entity);
-          }
-        } catch { /* viewer may be destroyed */ }
-        if (viewer!.trackedEntity !== entity) {
-          entityMapRef.current.delete(icao);
-          positionMapRef.current.delete(icao);
-          flightStateRef.current.delete(icao);
-        }
+        collections.trails.remove(trail);
+        trailMapRef.current.delete(icao);
+      }
+    }
+
+    for (const [icao, routes] of routeMapRef.current) {
+      if (!activeIcaos.has(icao) || !showPaths) {
+        if (routes.completed) collections.routes.remove(routes.completed);
+        if (routes.remaining) collections.routes.remove(routes.remaining);
+        routeMapRef.current.delete(icao);
+      }
+    }
+
+    entityMapRef.current.forEach((entity, icao) => {
+      if (!activeIcaos.has(icao) && viewer.trackedEntity !== entity) {
+        viewer.entities.remove(entity);
+        entityMapRef.current.delete(icao);
+        positionMapRef.current.delete(icao);
+        flightStateRef.current.delete(icao);
       }
     });
 
-    // Restore trail/route visibility now that rebuild is complete
-    try {
-      cols.trails.show = visible;
-      cols.routes.show = visible && showPaths;
-    } catch { /* collections may have been destroyed */ }
-  }, [viewer, flights, visible, showPaths, altitudeFilter]);
+    recordLayerPerformance('flights', {
+      updateMs: performance.now() - startedAt,
+      primitives: primitiveMapRef.current.size * 2
+        + trailMapRef.current.size
+        + Array.from(routeMapRef.current.values()).reduce(
+          (count, routes) => count + (routes.completed ? 1 : 0) + (routes.remaining ? 1 : 0),
+          0,
+        ),
+      visibleCount: activeIcaos.size,
+    });
+  }, [altitudeFilter, flights, showPaths, viewer, visible]);
 
-  /* ── Effect 3: Visibility toggling ── */
   useEffect(() => {
-    const cols = collectionsRef.current;
-    if (!cols) return;
-    cols.billboards.show = visible;
-    cols.labels.show = visible && !isTracking;
-    cols.trails.show = visible;
-    cols.routes.show = visible && showPaths;
-  }, [visible, isTracking, showPaths]);
+    const collections = collectionsRef.current;
+    if (!collections) {
+      return;
+    }
 
-  /* ── Effect 4: Dead-reckoning via Cesium preUpdate ──────────────── */
-  // Uses preUpdate (NOT preRender) so position updates happen BEFORE Cesium
-  // positions the camera for trackedEntity — eliminates the one-frame lag
-  // that caused aircraft to "drift ahead" of the crosshair.
-  //
-  // Tracked entity: 60 fps for smooth camera follow
-  // All others: bulk-updated every 1 s for visible drift
+    collections.billboards.show = visible;
+    collections.labels.show = visible && !isTracking;
+    collections.trails.show = visible;
+    collections.routes.show = visible && showPaths;
+  }, [isTracking, showPaths, visible]);
+
   useEffect(() => {
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     let lastBulkUpdate = 0;
-    const BULK_MS = 1000;
+    const bulkMs = 1_000;
 
     const onPreUpdate = () => {
-      try {
-        if (viewer.isDestroyed()) return;
-      } catch { return; }
+      if (viewer.isDestroyed()) {
+        return;
+      }
 
       const now = Date.now();
       const tracked = viewer.trackedEntity;
-
-      // Far-side occlusion + tracked-entity scale:
-      // hide billboards behind the globe and enlarge the selected aircraft
-      const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
       const trackedId = tracked && typeof tracked.id === 'string' && tracked.id.startsWith('flight-')
-        ? tracked.id.slice(7) : null;
+        ? tracked.id.slice(7)
+        : null;
+      const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
+      const shouldRefreshOcclusion = now - lastOcclusionUpdateRef.current >= 180;
 
-      for (const [icao, prims] of primitiveMapRef.current) {
-        const pos = positionMapRef.current.get(icao);
-        if (pos) {
-          const vis = occluder.isPointVisible(pos);
-          prims.billboard.show = vis;
-          prims.label.show = vis;
-        }
-        // Scale up the tracked billboard, restore normal scale for the rest
+      if (shouldRefreshOcclusion) {
+        lastOcclusionUpdateRef.current = now;
+      }
+
+      for (const [icao, primitives] of primitiveMapRef.current) {
+        const position = positionMapRef.current.get(icao);
         if (icao === trackedId) {
-          prims.billboard.scale = TRACKED_SCALE;
-          // Render on top of globe so the icon is never clipped
-          prims.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
-          // Screen-aligned mode: compensate rotation for camera heading so the
-          // icon always points along the flight path regardless of orbit angle
-          prims.billboard.alignedAxis = Cartesian3.ZERO;
-          const st = flightStateRef.current.get(icao);
-          if (st && st.heading != null) {
-            prims.billboard.rotation = viewer.camera.heading - CesiumMath.toRadians(st.heading);
-          }
-        } else {
-          // Non-tracked: globe-fixed heading via UNIT_Z axis
-          prims.billboard.disableDepthTestDistance = 0;
-          prims.billboard.alignedAxis = Cartesian3.UNIT_Z;
+          primitives.billboard.scale = TRACKED_SCALE;
+          primitives.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
+          primitives.billboard.alignedAxis = Cartesian3.ZERO;
+          primitives.billboard.show = true;
+          primitives.label.show = false;
+
           const state = flightStateRef.current.get(icao);
-          prims.billboard.scale = state ? getAltitudeScale(state.alt / 0.3048) : 0.3;
+          if (state?.heading != null) {
+            primitives.billboard.rotation = viewer.camera.heading - CesiumMath.toRadians(state.heading);
+          }
+          continue;
+        }
+
+        primitives.billboard.disableDepthTestDistance = 0;
+        primitives.billboard.alignedAxis = Cartesian3.UNIT_Z;
+
+        const state = flightStateRef.current.get(icao);
+        primitives.billboard.scale = state ? getAltitudeScale(state.alt / 0.3048) : 0.3;
+
+        if (position && shouldRefreshOcclusion) {
+          const visibleToCamera = occluder.isPointVisible(position);
+          primitives.billboard.show = visibleToCamera;
+          primitives.label.show = visibleToCamera && !isTracking;
         }
       }
 
-      // Tracked flight: dead-reckon every frame
       if (tracked && typeof tracked.id === 'string' && tracked.id.startsWith('flight-')) {
         const icao = tracked.id.slice(7);
         const state = flightStateRef.current.get(icao);
         if (state) {
-          const dtSec = (now - state.updatedAt) / 1000;
-          let lat = state.lat;
-          let lon = state.lon;
+          const dtSeconds = (now - state.updatedAt) / 1000;
+          let latitude = state.lat;
+          let longitude = state.lon;
 
-          if (state.heading != null && state.speed != null && state.speed > 10 && dtSec > 0 && dtSec < 120) {
+          if (state.heading != null && state.speed != null && state.speed > 10 && dtSeconds > 0 && dtSeconds < 120) {
             const speedMps = state.speed * 0.514444;
-            const headRad = CesiumMath.toRadians(state.heading);
-            lat += (Math.cos(headRad) * speedMps * dtSec) / 111320;
-            const cosLat = Math.cos(lat * (Math.PI / 180)) || 0.0001;
-            lon += (Math.sin(headRad) * speedMps * dtSec) / (111320 * cosLat);
+            const headingRadians = CesiumMath.toRadians(state.heading);
+            latitude += (Math.cos(headingRadians) * speedMps * dtSeconds) / 111320;
+            const cosLatitude = Math.cos(latitude * (Math.PI / 180)) || 0.0001;
+            longitude += (Math.sin(headingRadians) * speedMps * dtSeconds) / (111320 * cosLatitude);
           }
 
-          const pos = Cartesian3.fromDegrees(lon, lat, state.alt);
-          // Update position map — CallbackProperty reads this every frame
-          positionMapRef.current.set(icao, pos);
-
-          const prims = primitiveMapRef.current.get(icao);
-          if (prims) {
-            try {
-              prims.billboard.position = pos;
-              prims.label.position = pos;
-            } catch { /* primitive may have been removed during data refresh */ }
+          const normalizedLongitude = normalizeLongitude(longitude);
+          if (
+            isRenderableLatitude(latitude) &&
+            isRenderableLongitude(normalizedLongitude) &&
+            isRenderableAltitude(state.alt, { min: 0, max: 100_000 })
+          ) {
+            const position = Cartesian3.fromDegrees(normalizedLongitude, latitude, state.alt);
+            positionMapRef.current.set(icao, position);
+            const primitives = primitiveMapRef.current.get(icao);
+            if (primitives) {
+              primitives.billboard.position = position;
+              primitives.label.position = position;
+            }
           }
         }
       }
 
-      // Bulk dead-reckon all others every BULK_MS
-      if (now - lastBulkUpdate >= BULK_MS) {
+      if (now - lastBulkUpdate >= bulkMs) {
         lastBulkUpdate = now;
-        const trackedIcao = tracked && typeof tracked.id === 'string' && tracked.id.startsWith('flight-')
-          ? tracked.id.slice(7) : null;
-
-        for (const [icao, prims] of primitiveMapRef.current) {
-          if (icao === trackedIcao) continue;
-          const state = flightStateRef.current.get(icao);
-          if (!state) continue;
-          const dtSec = (now - state.updatedAt) / 1000;
-          if (dtSec <= 0 || dtSec > 120) continue;
-
-          let lat = state.lat;
-          let lon = state.lon;
-          if (state.heading != null && state.speed != null && state.speed > 10) {
-            const speedMps = state.speed * 0.514444;
-            const headRad = CesiumMath.toRadians(state.heading);
-            lat += (Math.cos(headRad) * speedMps * dtSec) / 111320;
-            const cosLat = Math.cos(lat * (Math.PI / 180)) || 0.0001;
-            lon += (Math.sin(headRad) * speedMps * dtSec) / (111320 * cosLat);
+        for (const [icao, primitives] of primitiveMapRef.current) {
+          if (icao === trackedId) {
+            continue;
           }
 
-          const pos = Cartesian3.fromDegrees(lon, lat, state.alt);
-          // Update position map so CallbackProperty stays current for all entities
-          positionMapRef.current.set(icao, pos);
-          try {
-            prims.billboard.position = pos;
-            prims.label.position = pos;
-          } catch { /* primitive may have been removed */ }
+          const state = flightStateRef.current.get(icao);
+          if (!state) {
+            continue;
+          }
+
+          const dtSeconds = (now - state.updatedAt) / 1000;
+          if (dtSeconds <= 0 || dtSeconds > 120) {
+            continue;
+          }
+
+          let latitude = state.lat;
+          let longitude = state.lon;
+          if (state.heading != null && state.speed != null && state.speed > 10) {
+            const speedMps = state.speed * 0.514444;
+            const headingRadians = CesiumMath.toRadians(state.heading);
+            latitude += (Math.cos(headingRadians) * speedMps * dtSeconds) / 111320;
+            const cosLatitude = Math.cos(latitude * (Math.PI / 180)) || 0.0001;
+            longitude += (Math.sin(headingRadians) * speedMps * dtSeconds) / (111320 * cosLatitude);
+          }
+
+          const normalizedLongitude = normalizeLongitude(longitude);
+          if (
+            !isRenderableLatitude(latitude) ||
+            !isRenderableLongitude(normalizedLongitude) ||
+            !isRenderableAltitude(state.alt, { min: 0, max: 100_000 })
+          ) {
+            continue;
+          }
+
+          const position = Cartesian3.fromDegrees(normalizedLongitude, latitude, state.alt);
+          positionMapRef.current.set(icao, position);
+          primitives.billboard.position = position;
+          primitives.label.position = position;
         }
       }
     };
 
     viewer.scene.preUpdate.addEventListener(onPreUpdate);
     return () => {
-      try {
-        if (!viewer.isDestroyed()) {
-          viewer.scene.preUpdate.removeEventListener(onPreUpdate);
-        }
-      } catch { /* viewer may already be destroyed */ }
+      if (!viewer.isDestroyed()) {
+        viewer.scene.preUpdate.removeEventListener(onPreUpdate);
+      }
     };
-  }, [viewer]);
-
-  // Cleanup backing entities on unmount only
-  useEffect(() => {
-    return () => {
-      try {
-        if (viewer && !viewer.isDestroyed()) {
-          entityMapRef.current.forEach((entity) => {
-            try { viewer.entities.remove(entity); } catch { /* ok */ }
-          });
-        }
-      } catch { /* viewer may be destroyed during HMR */ }
-      entityMapRef.current.clear();
-      positionMapRef.current.clear();
-      flightStateRef.current.clear();
-    };
-  }, [viewer]);
+  }, [isTracking, viewer]);
 
   return null;
 }

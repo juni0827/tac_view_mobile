@@ -20,20 +20,32 @@ import TrackedEntityPanel from './components/ui/TrackedEntityPanel';
 import SplashScreen from './components/ui/SplashScreen';
 import FilmGrain from './components/ui/FilmGrain';
 import VisualIntelligenceLayer from './components/layers/VisualIntelligenceLayer';
-import { useEarthquakes } from './hooks/useEarthquakes';
-import { useSatellites } from './hooks/useSatellites';
-import { useFlights } from './hooks/useFlights';
+import { useEarthquakes, type Earthquake } from './hooks/useEarthquakes';
+import { useSatellites, type SatellitePosition } from './hooks/useSatellites';
+import { useFlights, type Flight } from './hooks/useFlights';
 import { useFlightsLive } from './hooks/useFlightsLive';
 import { useTraffic } from './hooks/useTraffic';
 import { useCameras } from './hooks/useCameras';
-import { useShips } from './hooks/useShips';
+import { useShips, type Ship } from './hooks/useShips';
 import { useGeolocation } from './hooks/useGeolocation';
 import { useIsMobile } from './hooks/useIsMobile';
 import { useAudio } from './hooks/useAudio';
 import { useVisualIntelligence } from './hooks/useVisualIntelligence';
+import { groupController } from './intelligence/groupController';
 import type { ShaderMode } from './shaders/postprocess';
 import type { IntelFeedItem } from './components/ui/IntelFeed';
 import type { TrackedEntityInfo } from './types/trackedEntity';
+import type { RenderCameraState } from './types/rendering';
+import {
+  isRenderableAltitude,
+  isRenderableLatitude,
+  isRenderableLongitude,
+  normalizeLongitude,
+  sanitizeHeading,
+  sanitizeNullableNumber,
+} from './lib/cesiumSafety';
+import { buildRenderBudget, shouldRefreshCameraQuery } from './lib/renderBudget';
+import { GridSpatialIndex, deriveRenderPriorityIds, selectPriorityItems } from './lib/renderQuery';
 
 interface CameraState {
   latitude: number;
@@ -41,6 +53,13 @@ interface CameraState {
   altitude: number;
   heading: number;
   pitch: number;
+}
+
+interface RenderEntry<T> {
+  id: string;
+  latitude: number;
+  longitude: number;
+  item: T;
 }
 
 const DEFAULT_ALTITUDE_FILTER: Record<AltitudeBand, boolean> = {
@@ -59,10 +78,139 @@ const DEFAULT_SATELLITE_FILTER: Record<SatelliteCategory, boolean> = {
 const DEFAULT_CAMERA: CameraState = {
   latitude: -33.8688,
   longitude: 151.2093,
-  altitude: 50000,
+  altitude: 20_000_000,
   heading: 0,
-  pitch: -45,
+  pitch: -90,
 };
+
+function toRenderCameraState(camera: CameraState, timestamp = Date.now()): RenderCameraState {
+  return {
+    ...camera,
+    timestamp,
+  };
+}
+
+const DEFAULT_LAYERS = {
+  flights: false,
+  satellites: false,
+  earthquakes: false,
+  traffic: false,
+  cctv: false,
+  ships: false,
+};
+
+const RECOVERY_LAYERS = {
+  flights: false,
+  satellites: false,
+  earthquakes: false,
+  traffic: false,
+  cctv: false,
+  ships: false,
+};
+
+function sanitizeFlight(flight: Flight): Flight | null {
+  if (
+    !isRenderableLatitude(flight.latitude) ||
+    !isRenderableLongitude(flight.longitude) ||
+    !isRenderableAltitude(flight.altitude, { min: 0, max: 100_000 })
+  ) {
+    return null;
+  }
+
+  return {
+    ...flight,
+    longitude: normalizeLongitude(flight.longitude),
+    altitudeFeet: isRenderableAltitude(flight.altitudeFeet, { min: 0, max: 350_000 }) ? flight.altitudeFeet : 0,
+    heading: sanitizeHeading(flight.heading),
+    velocity: sanitizeNullableNumber(flight.velocity, { min: 0, max: 20_000 }),
+    velocityKnots: sanitizeNullableNumber(flight.velocityKnots, { min: 0, max: 20_000 }),
+    verticalRate: sanitizeNullableNumber(flight.verticalRate, { min: -20_000, max: 20_000 }),
+  };
+}
+
+function sanitizeSatellitePosition(satellite: SatellitePosition): SatellitePosition | null {
+  if (
+    !isRenderableLatitude(satellite.latitude) ||
+    !isRenderableLongitude(satellite.longitude) ||
+    !isRenderableAltitude(satellite.altitude, { min: 0, max: 500_000 })
+  ) {
+    return null;
+  }
+
+  return {
+    ...satellite,
+    longitude: normalizeLongitude(satellite.longitude),
+    orbitPath: satellite.orbitPath.filter((point) =>
+      isRenderableLatitude(point.latitude) &&
+      isRenderableLongitude(point.longitude) &&
+      isRenderableAltitude(point.altitude, { min: 0, max: 500_000 }),
+    ).map((point) => ({
+      latitude: point.latitude,
+      longitude: normalizeLongitude(point.longitude),
+      altitude: point.altitude,
+    })),
+  };
+}
+
+function sanitizeEarthquake(earthquake: Earthquake): Earthquake | null {
+  if (
+    !isRenderableLatitude(earthquake.latitude) ||
+    !isRenderableLongitude(earthquake.longitude)
+  ) {
+    return null;
+  }
+
+  return {
+    ...earthquake,
+    longitude: normalizeLongitude(earthquake.longitude),
+    mag: sanitizeNullableNumber(earthquake.mag, { min: -5, max: 15 }) ?? 0,
+    depth: sanitizeNullableNumber(earthquake.depth, { min: -20, max: 1_000 }) ?? 0,
+  };
+}
+
+function sanitizeCamera(camera: CameraFeed): CameraFeed | null {
+  if (
+    !isRenderableLatitude(camera.latitude) ||
+    !isRenderableLongitude(camera.longitude)
+  ) {
+    return null;
+  }
+
+  return {
+    ...camera,
+    longitude: normalizeLongitude(camera.longitude),
+  };
+}
+
+function sanitizeShip(ship: Ship): Ship | null {
+  if (
+    !isRenderableLatitude(ship.latitude) ||
+    !isRenderableLongitude(ship.longitude)
+  ) {
+    return null;
+  }
+
+  return {
+    ...ship,
+    longitude: normalizeLongitude(ship.longitude),
+    heading: sanitizeHeading(ship.heading),
+    cog: sanitizeHeading(ship.cog),
+    sog: sanitizeNullableNumber(ship.sog, { min: 0, max: 200 }) ?? 0,
+  };
+}
+
+function compactSanitized<T>(items: T[], sanitizer: (item: T) => T | null): T[] {
+  const safeItems: T[] = [];
+
+  for (const item of items) {
+    const safeItem = sanitizer(item);
+    if (safeItem) {
+      safeItems.push(safeItem);
+    }
+  }
+
+  return safeItems;
+}
 
 /**
  * Convert a viewDirection compass string (e.g. "East", "N-W") to heading
@@ -97,22 +245,17 @@ function App() {
 
   // Boot sequence
   const [booted, setBooted] = useState(false);
+  const [globeInstanceKey, setGlobeInstanceKey] = useState(0);
+  const [renderRecoveryNotice, setRenderRecoveryNotice] = useState<string | null>(null);
 
   // State: shader mode
-  const [shaderMode, setShaderMode] = useState<ShaderMode>('crt');
+  const [shaderMode, setShaderMode] = useState<ShaderMode>('none');
 
   // State: map tiles (google 3D vs OSM for testing)
-  const [mapTiles, setMapTiles] = useState<'google' | 'osm'>('google');
+  const [mapTiles, setMapTiles] = useState<'google' | 'osm'>('osm');
 
   // State: data layer visibility
-  const [layers, setLayers] = useState({
-    flights: true,
-    satellites: true,
-    earthquakes: true,
-    traffic: false,
-    cctv: true,
-    ships: false,
-  });
+  const [layers, setLayers] = useState(DEFAULT_LAYERS);
 
   // State: CCTV country filter
   const [cctvCountryFilter, setCctvCountryFilter] = useState('ALL');
@@ -128,8 +271,12 @@ function App() {
 
   // State: camera position
   const [camera, setCamera] = useState<CameraState>(DEFAULT_CAMERA);
-  const latestCameraRef = useRef<CameraState>(DEFAULT_CAMERA);
-  const cameraFlushTimerRef = useRef<number | null>(null);
+  const [renderCamera, setRenderCamera] = useState<RenderCameraState>(() => toRenderCameraState(DEFAULT_CAMERA));
+  const [queryCamera, setQueryCamera] = useState<RenderCameraState>(() => toRenderCameraState(DEFAULT_CAMERA));
+  const latestCameraRef = useRef<RenderCameraState>(toRenderCameraState(DEFAULT_CAMERA));
+  const lastQueryCameraRef = useRef<RenderCameraState>(toRenderCameraState(DEFAULT_CAMERA));
+  const renderCameraFlushTimerRef = useRef<number | null>(null);
+  const statusCameraFlushTimerRef = useRef<number | null>(null);
 
   // State: tracked entity (lock view)
   const [trackedEntity, setTrackedEntity] = useState<TrackedEntityInfo | null>(null);
@@ -156,6 +303,20 @@ function App() {
 
   const handleViewerReady = useCallback((viewer: CesiumViewer) => {
     viewerRef.current = viewer;
+    setRenderRecoveryNotice(null);
+  }, []);
+
+  const handleRenderFailure = useCallback((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[TAC_VIEW] Resetting viewer in safe mode after render failure:', error);
+
+    setTrackedEntity(null);
+    setSelectedCameraId(null);
+    setShaderMode('none');
+    setMapTiles('osm');
+    setLayers(RECOVERY_LAYERS);
+    setRenderRecoveryNotice(`SAFE STARTUP MODE ACTIVE: ${message}`);
+    setGlobeInstanceKey((value) => value + 1);
   }, []);
 
   const handleUnlockTrackedEntity = useCallback(() => {
@@ -170,8 +331,11 @@ function App() {
 
   useEffect(() => {
     return () => {
-      if (cameraFlushTimerRef.current !== null) {
-        window.clearTimeout(cameraFlushTimerRef.current);
+      if (renderCameraFlushTimerRef.current !== null) {
+        window.clearTimeout(renderCameraFlushTimerRef.current);
+      }
+      if (statusCameraFlushTimerRef.current !== null) {
+        window.clearTimeout(statusCameraFlushTimerRef.current);
       }
     };
   }, []);
@@ -192,26 +356,32 @@ function App() {
     });
   }, []);
 
+  const renderBudget = useMemo(
+    () => buildRenderBudget(renderCamera, Boolean(trackedEntity)),
+    [renderCamera, trackedEntity],
+  );
+
   // Data hooks
-  const { earthquakes, feedItems: eqFeedItems } = useEarthquakes(layers.earthquakes);
-  const { satellites, feedItems: satFeedItems } = useSatellites(layers.satellites);
+  const { earthquakes: rawEarthquakes, feedItems: eqFeedItems } = useEarthquakes(layers.earthquakes);
+  const { satellites: rawSatellites, feedItems: satFeedItems } = useSatellites(layers.satellites);
   const { flights: flightsGlobal, feedItems: fltFeedItems } = useFlights(layers.flights);
   const { flightsLive } = useFlightsLive(
     layers.flights,
-    camera.latitude,
-    camera.longitude,
-    camera.altitude,
+    queryCamera.latitude,
+    queryCamera.longitude,
+    queryCamera.altitude,
     !!trackedEntity,
   );
   const { roads: trafficRoads, vehicles: trafficVehicles } = useTraffic(
     layers.traffic,
-    camera.latitude,
-    camera.longitude,
-    camera.altitude,
+    queryCamera.latitude,
+    queryCamera.longitude,
+    queryCamera.altitude,
+    renderBudget.trafficReactUpdateMs,
   );
-  const { ships, feedItems: shipFeedItems, isLoading: shipsLoading } = useShips(layers.ships);
+  const { ships: rawShips, feedItems: shipFeedItems, isLoading: shipsLoading } = useShips(layers.ships);
   const {
-    cameras: cctvCameras,
+    cameras: rawCctvCameras,
     feedItems: cctvFeedItems,
     isLoading: cctvLoading,
     error: cctvError,
@@ -254,7 +424,7 @@ function App() {
 
   // Smart layer swap: live (adsb.fi 5s) replaces global (FR24 30s) for matching aircraft.
   // Global aircraft outside the live region remain visible. Zero duplicates guaranteed.
-  const flights = useMemo(() => {
+  const rawFlights = useMemo(() => {
     if (flightsLive.length === 0) return flightsGlobal;
     if (flightsGlobal.length === 0) return flightsLive;
 
@@ -291,12 +461,157 @@ function App() {
     return [...globalOnly, ...enrichedLive];
   }, [flightsGlobal, flightsLive]);
 
-  const visualIntelligence = useVisualIntelligence(
-    trackedEntity,
-    flights,
-    ships,
-    satellites,
-    cctvCameras,
+  const flights = useMemo(() => compactSanitized(rawFlights, sanitizeFlight), [rawFlights]);
+  const satellites = useMemo(() => compactSanitized(rawSatellites, sanitizeSatellitePosition), [rawSatellites]);
+  const earthquakes = useMemo(() => compactSanitized(rawEarthquakes, sanitizeEarthquake), [rawEarthquakes]);
+  const cctvCameras = useMemo(() => compactSanitized(rawCctvCameras, sanitizeCamera), [rawCctvCameras]);
+  const ships = useMemo(() => compactSanitized(rawShips, sanitizeShip), [rawShips]);
+
+  useEffect(() => {
+    groupController.pushSources({
+      flights,
+      ships,
+      satellites,
+      cameras: cctvCameras,
+    });
+  }, [cctvCameras, flights, satellites, ships]);
+
+  useEffect(() => {
+    groupController.setSelection(trackedEntity);
+  }, [trackedEntity]);
+
+  useEffect(() => {
+    groupController.setCameraState(renderCamera);
+  }, [renderCamera]);
+
+  const visualIntelligence = useVisualIntelligence();
+
+  const flightEntries = useMemo<RenderEntry<Flight>[]>(
+    () => flights.map((flight) => ({
+      id: `flight-${flight.icao24}`,
+      latitude: flight.latitude,
+      longitude: flight.longitude,
+      item: flight,
+    })),
+    [flights],
+  );
+  const flightIndex = useMemo(() => new GridSpatialIndex(flightEntries, 4), [flightEntries]);
+
+  const satelliteEntries = useMemo<RenderEntry<SatellitePosition>[]>(
+    () => satellites.map((satellite) => ({
+      id: `sat-${satellite.noradId}`,
+      latitude: satellite.latitude,
+      longitude: satellite.longitude,
+      item: satellite,
+    })),
+    [satellites],
+  );
+  const satelliteIndex = useMemo(() => new GridSpatialIndex(satelliteEntries, 6), [satelliteEntries]);
+
+  const earthquakeEntries = useMemo<RenderEntry<Earthquake>[]>(
+    () => earthquakes.map((earthquake) => ({
+      id: `eq-${earthquake.id}`,
+      latitude: earthquake.latitude,
+      longitude: earthquake.longitude,
+      item: earthquake,
+    })),
+    [earthquakes],
+  );
+  const earthquakeIndex = useMemo(() => new GridSpatialIndex(earthquakeEntries, 5), [earthquakeEntries]);
+
+  const cameraEntries = useMemo<RenderEntry<CameraFeed>[]>(
+    () => cctvCameras.map((cctvCamera) => ({
+      id: cctvCamera.id,
+      latitude: cctvCamera.latitude,
+      longitude: cctvCamera.longitude,
+      item: cctvCamera,
+    })),
+    [cctvCameras],
+  );
+  const cameraIndex = useMemo(() => new GridSpatialIndex(cameraEntries, 2), [cameraEntries]);
+
+  const shipEntries = useMemo<RenderEntry<Ship>[]>(
+    () => ships.map((ship) => ({
+      id: `ship-${ship.mmsi}`,
+      latitude: ship.latitude,
+      longitude: ship.longitude,
+      item: ship,
+    })),
+    [ships],
+  );
+  const shipIndex = useMemo(() => new GridSpatialIndex(shipEntries, 4), [shipEntries]);
+
+  const selectionPriorityIds = useMemo(
+    () => deriveRenderPriorityIds(visualIntelligence.selectionContext),
+    [visualIntelligence.selectionContext],
+  );
+
+  const globeFlights = useMemo(
+    () => selectPriorityItems(flightEntries, {
+      budget: renderBudget.flights,
+      camera: renderCamera,
+      trackedId: trackedEntity?.id,
+      priorityIds: selectionPriorityIds,
+      index: flightIndex,
+    }).map((entry) => entry.item),
+    [flightEntries, flightIndex, renderBudget.flights, renderCamera, selectionPriorityIds, trackedEntity?.id],
+  );
+
+  const globeSatellites = useMemo(
+    () => selectPriorityItems(satelliteEntries, {
+      budget: renderBudget.satellites,
+      camera: renderCamera,
+      trackedId: trackedEntity?.id,
+      priorityIds: selectionPriorityIds,
+      index: satelliteIndex,
+    }).map((entry) => entry.item),
+    [renderBudget.satellites, renderCamera, satelliteEntries, satelliteIndex, selectionPriorityIds, trackedEntity?.id],
+  );
+
+  const globeEarthquakes = useMemo(
+    () => selectPriorityItems(earthquakeEntries, {
+      budget: renderBudget.earthquakes,
+      camera: renderCamera,
+      trackedId: trackedEntity?.id,
+      priorityIds: selectionPriorityIds,
+      index: earthquakeIndex,
+    }).map((entry) => entry.item),
+    [earthquakeEntries, earthquakeIndex, renderBudget.earthquakes, renderCamera, selectionPriorityIds, trackedEntity?.id],
+  );
+
+  const cctvPriorityIds = useMemo(() => {
+    const ids = new Set(selectionPriorityIds);
+    if (selectedCameraId) {
+      ids.add(selectedCameraId);
+    }
+    if (trackedEntity?.entityType === 'cctv' && trackedEntity.id.startsWith('cctv-')) {
+      ids.add(trackedEntity.id.slice(5));
+    }
+    return ids;
+  }, [selectedCameraId, selectionPriorityIds, trackedEntity]);
+
+  const globeCameras = useMemo(
+    () => layers.cctv
+      ? selectPriorityItems(cameraEntries, {
+        budget: renderBudget.cctv,
+        camera: renderCamera,
+        selectedId: selectedCameraId,
+        priorityIds: cctvPriorityIds,
+        index: cameraIndex,
+      }).map((entry) => entry.item)
+      : [],
+    [cameraEntries, cameraIndex, cctvPriorityIds, layers.cctv, renderBudget.cctv, renderCamera, selectedCameraId],
+  );
+
+  const globeShips = useMemo(
+    () => selectPriorityItems(shipEntries, {
+      budget: renderBudget.ships,
+      camera: renderCamera,
+      trackedId: trackedEntity?.id,
+      priorityIds: selectionPriorityIds,
+      index: shipIndex,
+    }).map((entry) => entry.item),
+    [renderBudget.ships, renderCamera, selectionPriorityIds, shipEntries, shipIndex, trackedEntity?.id],
   );
 
   // Combine intel feed items
@@ -315,18 +630,77 @@ function App() {
   // Handlers
   const handleCameraChange = useCallback(
     (lat: number, lon: number, alt: number, heading: number, pitch: number) => {
-      latestCameraRef.current = { latitude: lat, longitude: lon, altitude: alt, heading, pitch };
+      const nextCamera = {
+        latitude: lat,
+        longitude: lon,
+        altitude: alt,
+        heading,
+        pitch,
+        timestamp: Date.now(),
+      };
+      latestCameraRef.current = nextCamera;
 
-      if (cameraFlushTimerRef.current !== null) {
-        return;
+      if (shouldRefreshCameraQuery(lastQueryCameraRef.current, nextCamera)) {
+        lastQueryCameraRef.current = nextCamera;
+        setQueryCamera(nextCamera);
       }
 
-      cameraFlushTimerRef.current = window.setTimeout(() => {
-        cameraFlushTimerRef.current = null;
-        setCamera(latestCameraRef.current);
-      }, 200);
+      if (renderCameraFlushTimerRef.current === null) {
+        renderCameraFlushTimerRef.current = window.setTimeout(() => {
+          renderCameraFlushTimerRef.current = null;
+          setRenderCamera(latestCameraRef.current);
+        }, 80);
+      }
+
+      if (statusCameraFlushTimerRef.current === null) {
+        statusCameraFlushTimerRef.current = window.setTimeout(() => {
+          statusCameraFlushTimerRef.current = null;
+          setCamera({
+            latitude: latestCameraRef.current.latitude,
+            longitude: latestCameraRef.current.longitude,
+            altitude: latestCameraRef.current.altitude,
+            heading: latestCameraRef.current.heading,
+            pitch: latestCameraRef.current.pitch,
+          });
+        }, 250);
+      }
     },
-    []
+    [],
+  );
+
+  const handleCameraMoveEnd = useCallback(
+    (lat: number, lon: number, alt: number, heading: number, pitch: number) => {
+      const nextCamera = {
+        latitude: lat,
+        longitude: lon,
+        altitude: alt,
+        heading,
+        pitch,
+        timestamp: Date.now(),
+      };
+      latestCameraRef.current = nextCamera;
+      lastQueryCameraRef.current = nextCamera;
+
+      if (renderCameraFlushTimerRef.current !== null) {
+        window.clearTimeout(renderCameraFlushTimerRef.current);
+        renderCameraFlushTimerRef.current = null;
+      }
+      if (statusCameraFlushTimerRef.current !== null) {
+        window.clearTimeout(statusCameraFlushTimerRef.current);
+        statusCameraFlushTimerRef.current = null;
+      }
+
+      setRenderCamera(nextCamera);
+      setQueryCamera(nextCamera);
+      setCamera({
+        latitude: lat,
+        longitude: lon,
+        altitude: alt,
+        heading,
+        pitch,
+      });
+    },
+    [],
   );
 
   const handleLayerToggle = useCallback((layer: 'flights' | 'satellites' | 'earthquakes' | 'traffic' | 'cctv' | 'ships') => {
@@ -427,28 +801,32 @@ function App() {
     setBooted(true);
   }, [audio]);
 
+  const opticsOverlayEnabled = shaderMode !== 'none';
+
   // Splash screen
   if (!booted) {
     return <SplashScreen onComplete={handleBootComplete} audio={audio} />;
   }
 
   return (
-    <div data-testid="app-root" className="w-screen h-screen bg-wv-black overflow-hidden scanline-overlay">
-      {/* Animated film grain texture */}
-      <FilmGrain opacity={0.06} />
+    <div data-testid="app-root" className={`w-screen h-screen bg-wv-black overflow-hidden ${opticsOverlayEnabled ? 'scanline-overlay' : ''}`}>
+      {opticsOverlayEnabled && <FilmGrain opacity={0.06} />}
       {/* 3D Globe (fills entire viewport) */}
       <GlobeViewer
+        key={globeInstanceKey}
         shaderMode={shaderMode}
         mapTiles={mapTiles}
         onCameraChange={handleCameraChange}
+        onCameraMoveEnd={handleCameraMoveEnd}
         onTrackEntity={handleTrackEntity}
         onViewerReady={handleViewerReady}
+        onRenderFailure={handleRenderFailure}
         onCctvClick={handleCctvClickOnGlobe}
       >
-        <EarthquakeLayer earthquakes={earthquakes} visible={layers.earthquakes} isTracking={!!trackedEntity} />
-        <SatelliteLayer satellites={satellites} visible={layers.satellites} showPaths={showSatPaths} categoryFilter={satCategoryFilter} isTracking={!!trackedEntity} />
+        <EarthquakeLayer earthquakes={globeEarthquakes} visible={layers.earthquakes} isTracking={!!trackedEntity} />
+        <SatelliteLayer satellites={globeSatellites} visible={layers.satellites} showPaths={showSatPaths} categoryFilter={satCategoryFilter} isTracking={!!trackedEntity} />
         <FlightLayer
-          flights={flights}
+          flights={globeFlights}
           visible={layers.flights}
           showPaths={showPaths}
           altitudeFilter={altitudeFilter}
@@ -463,20 +841,27 @@ function App() {
           congestionMode={false}
         />
         <CCTVLayer
-          cameras={cctvCameras}
+          cameras={globeCameras}
           visible={layers.cctv}
           selectedCameraId={selectedCameraId}
         />
         <ShipLayer
-          ships={ships}
+          ships={globeShips}
           visible={layers.ships}
           isTracking={!!trackedEntity}
         />
         <VisualIntelligenceLayer
-          groups={visualIntelligence.groups}
+          tieredGroups={visualIntelligence.tieredGroups}
           selectionContext={visualIntelligence.selectionContext}
+          cameraAltitude={renderCamera.altitude}
         />
       </GlobeViewer>
+
+      {renderRecoveryNotice && (
+        <div className="absolute top-4 left-1/2 z-50 -translate-x-1/2 rounded border border-red-500/60 bg-black/85 px-4 py-2 text-xs tracking-[0.2em] text-red-300">
+          {renderRecoveryNotice}
+        </div>
+      )}
 
       {/* Tactical UI Overlay */}
       <Crosshair />

@@ -167,7 +167,7 @@ export default function EntityClickHandler({ onTrackEntity, onCctvClick }: Entit
 
 function classifyEntity(entity: CesiumEntity): TrackedEntityType {
   if (typeof entity.id === 'string') {
-    if (entity.id.startsWith('group-')) return 'group';
+    if (entity.id.startsWith('group-') || entity.id.startsWith('micro-') || entity.id.startsWith('meso-') || entity.id.startsWith('cloud-')) return 'group';
     if (entity.id.startsWith('facility-')) return 'facility';
     if (entity.id.startsWith('cctv-')) return 'cctv';
     if (entity.id.startsWith('sat-')) return 'satellite';

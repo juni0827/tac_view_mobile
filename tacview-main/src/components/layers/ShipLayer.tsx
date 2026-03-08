@@ -1,187 +1,166 @@
-/**
- * ShipLayer — High-performance imperative rendering of AIS vessel positions.
- *
- * Architecture mirrors FlightLayer: BillboardCollection + LabelCollection +
- * PolylineCollection for heading trails. Avoids React reconciliation via
- * useCesium() + useEffect for tens of thousands of vessels.
- *
- * Key features:
- * - Ship icon canvas (top-down vessel silhouette, pointing UP)
- * - Colour by AIS ship type category (cargo=blue, tanker=orange, etc.)
- * - Heading rotation via TrueHeading (falls back to COG)
- * - Short heading trail line
- * - Labels with vessel name, speed, destination
- * - Backing Entity per vessel for trackedEntity camera follow
- * - Dead-reckoning between data refreshes (preUpdate listener)
- * - Far-side globe occlusion
- */
 import { useEffect, useRef } from 'react';
 import { useCesium } from 'resium';
 import {
+  Billboard,
+  BillboardCollection,
+  BlendOption,
+  CallbackProperty,
+  Cartesian2 as CesiumCartesian2,
   Cartesian3,
   Color,
-  NearFarScalar,
-  DistanceDisplayCondition,
-  Billboard,
-  Label,
-  BillboardCollection,
-  LabelCollection,
-  PolylineCollection,
-  BlendOption,
-  VerticalOrigin,
-  HorizontalOrigin,
-  Cartesian2 as CesiumCartesian2,
-  LabelStyle,
-  Entity as CesiumEntity,
-  CallbackProperty,
   ConstantProperty,
-  Math as CesiumMath,
-  Material,
+  DistanceDisplayCondition,
   Ellipsoid,
+  Entity as CesiumEntity,
+  HorizontalOrigin,
+  Label,
+  LabelCollection,
+  LabelStyle,
+  Material,
+  Math as CesiumMath,
+  NearFarScalar,
+  Polyline,
+  PolylineCollection,
+  VerticalOrigin,
 } from 'cesium';
 import * as Cesium from 'cesium';
-
-const EllipsoidalOccluder = (Cesium as unknown as { EllipsoidalOccluder: new (
-  ellipsoid: typeof Ellipsoid.WGS84,
-  cameraPosition: Cartesian3,
-) => { isPointVisible(point: Cartesian3): boolean } }).EllipsoidalOccluder;
-
 import type { Ship, ShipCategory } from '../../hooks/useShips';
 import { getShipCategory } from '../../hooks/useShips';
+import { recordLayerPerformance } from '../../lib/performanceStore';
 
-/* ─── ship icon canvas ─────────────────────────────────────────── */
+const EllipsoidalOccluder = (Cesium as unknown as {
+  EllipsoidalOccluder: new (
+    ellipsoid: typeof Ellipsoid.WGS84,
+    cameraPosition: Cartesian3,
+  ) => { isPointVisible(point: Cartesian3): boolean };
+}).EllipsoidalOccluder;
 
-/** Create a white top-down vessel silhouette on a transparent canvas (28x28).
- *  Drawn pointing UP (north). Billboard.rotation rotates it to heading. */
-function createShipIcon(): HTMLCanvasElement {
-  const S = 28;
-  const canvas = document.createElement('canvas');
-  canvas.width = S;
-  canvas.height = S;
-  const c = canvas.getContext('2d')!;
-  const cx = S / 2;
-
-  c.fillStyle = '#FFFFFF';
-  c.beginPath();
-  // Bow (pointed top)
-  c.moveTo(cx, 2);
-  // Starboard hull
-  c.lineTo(cx + 5, 8);
-  c.lineTo(cx + 5, 22);
-  // Stern (flat bottom)
-  c.lineTo(cx + 3, 26);
-  c.lineTo(cx - 3, 26);
-  // Port hull
-  c.lineTo(cx - 5, 22);
-  c.lineTo(cx - 5, 8);
-  c.closePath();
-  c.fill();
-
-  // Bridge/superstructure indicator (small rectangle)
-  c.fillStyle = 'rgba(255,255,255,0.5)';
-  c.fillRect(cx - 3, 14, 6, 4);
-
-  return canvas;
-}
-
-let _shipIcon: HTMLCanvasElement | null = null;
-function getShipIcon(): HTMLCanvasElement {
-  if (!_shipIcon) _shipIcon = createShipIcon();
-  return _shipIcon;
-}
-
-/* ─── colour helpers ───────────────────────────────────────────── */
-
-const CATEGORY_COLORS: Record<ShipCategory, Color> = {
-  cargo:     Color.fromCssColorString('#00D4FF'),  // bright cyan
-  tanker:    Color.fromCssColorString('#FF9500'),  // vivid orange
-  passenger: Color.fromCssColorString('#39FF14'),  // neon green
-  fishing:   Color.fromCssColorString('#FFE640'),  // bright yellow
-  military:  Color.fromCssColorString('#FF3B30'),  // vivid red
-  tug:       Color.fromCssColorString('#E040FB'),  // bright magenta
-  pleasure:  Color.fromCssColorString('#00FFCC'),  // bright aqua
-  highspeed: Color.fromCssColorString('#FF4081'),  // hot pink
-  other:     Color.fromCssColorString('#FFEB3B'),  // yellow — high-vis against water/terrain
-};
-
-function getShipColor(category: ShipCategory): Color {
-  return CATEGORY_COLORS[category] ?? CATEGORY_COLORS.other;
-}
-
-/* ─── description HTML ─────────────────────────────────────────── */
-
-function buildShipDescription(s: Ship, category: ShipCategory): string {
-  const navStatusMap: Record<number, string> = {
-    0: 'Under way (engine)',
-    1: 'At anchor',
-    2: 'Not under command',
-    3: 'Restricted manoeuvrability',
-    4: 'Constrained by draught',
-    5: 'Moored',
-    6: 'Aground',
-    7: 'Fishing',
-    8: 'Under way (sailing)',
-    14: 'AIS-SART',
-    15: 'Not defined',
-  };
-  const status = s.navStatus != null ? (navStatusMap[s.navStatus] ?? `Code ${s.navStatus}`) : 'N/A';
-
-  return `
-    <p><b>Name:</b> ${s.name || 'Unknown'}</p>
-    <p><b>MMSI:</b> ${s.mmsi}</p>
-    <p><b>IMO:</b> ${s.imo ?? 'N/A'}</p>
-    <p><b>Call Sign:</b> ${s.callSign ?? 'N/A'}</p>
-    <p><b>Type:</b> ${category.toUpperCase()} (code ${s.shipType ?? '?'})</p>
-    <p><b>Flag:</b> ${s.country ?? 'N/A'}</p>
-    <p><b>Status:</b> ${status}</p>
-    <p><b>Speed:</b> ${s.sog != null ? s.sog.toFixed(1) + ' kt' : 'N/A'}</p>
-    <p><b>Heading:</b> ${s.heading != null ? Math.round(s.heading) + '°' : 'N/A'}</p>
-    <p><b>COG:</b> ${s.cog != null ? s.cog.toFixed(1) + '°' : 'N/A'}</p>
-    <p><b>Destination:</b> ${s.destination || 'N/A'}</p>
-    <p><b>Size:</b> ${s.length && s.width ? `${s.length}m × ${s.width}m` : 'N/A'}</p>
-    <p><b>Position:</b> ${s.latitude.toFixed(4)}°, ${s.longitude.toFixed(4)}°</p>
-  `;
-}
-
-/* ─── constants ────────────────────────────────────────────────── */
-
-const LABEL_OFFSET = new CesiumCartesian2(10, -4);
-const TRAIL_ALPHA = 0.45;
-const TRACKED_SCALE = 1.2;
-
-/* ═══════════════════════════════════════════════════════════════ */
-
-export interface ShipLayerProps {
+interface ShipLayerProps {
   ships: Ship[];
   visible: boolean;
   isTracking: boolean;
 }
 
+interface ShipState {
+  lat: number;
+  lon: number;
+  heading: number | null;
+  cog: number | null;
+  sog: number;
+  updatedAt: number;
+}
+
+interface ShipPrimitiveRefs {
+  billboard: Billboard;
+  label: Label;
+}
+
+const CATEGORY_COLORS: Record<ShipCategory, Color> = {
+  cargo: Color.fromCssColorString('#00D4FF'),
+  tanker: Color.fromCssColorString('#FF9500'),
+  passenger: Color.fromCssColorString('#39FF14'),
+  fishing: Color.fromCssColorString('#FFE640'),
+  military: Color.fromCssColorString('#FF3B30'),
+  tug: Color.fromCssColorString('#E040FB'),
+  pleasure: Color.fromCssColorString('#00FFCC'),
+  highspeed: Color.fromCssColorString('#FF4081'),
+  other: Color.fromCssColorString('#FFEB3B'),
+};
+
+const LABEL_OFFSET = new CesiumCartesian2(10, -4);
+const TRAIL_ALPHA = 0.35;
+const TRACKED_SCALE = 0.85;
+
+function getShipColor(category: ShipCategory) {
+  return CATEGORY_COLORS[category] ?? CATEGORY_COLORS.other;
+}
+
+function buildShipDescription(ship: Ship, category: ShipCategory) {
+  return `
+    <p><b>Name:</b> ${ship.name || ship.mmsi}</p>
+    <p><b>MMSI:</b> ${ship.mmsi}</p>
+    <p><b>Category:</b> ${category.toUpperCase()}</p>
+    <p><b>Destination:</b> ${ship.destination || 'N/A'}</p>
+    <p><b>Speed:</b> ${ship.sog.toFixed(1)} kt</p>
+    <p><b>Heading:</b> ${ship.heading ?? ship.cog ?? 'N/A'}</p>
+    <p><b>Call Sign:</b> ${ship.callSign || 'N/A'}</p>
+    <p><b>IMO:</b> ${ship.imo ?? 'N/A'}</p>
+  `;
+}
+
+function createShipIcon() {
+  const size = 28;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return canvas;
+  }
+
+  const centerX = size / 2;
+  context.fillStyle = '#FFFFFF';
+  context.beginPath();
+  context.moveTo(centerX, 2);
+  context.lineTo(centerX + 5, 8);
+  context.lineTo(centerX + 5, 22);
+  context.lineTo(centerX + 3, 26);
+  context.lineTo(centerX - 3, 26);
+  context.lineTo(centerX - 5, 22);
+  context.lineTo(centerX - 5, 8);
+  context.closePath();
+  context.fill();
+
+  context.fillStyle = 'rgba(255,255,255,0.5)';
+  context.fillRect(centerX - 3, 14, 6, 4);
+
+  return canvas;
+}
+
+let shipIcon: HTMLCanvasElement | null = null;
+function getShipIcon() {
+  if (!shipIcon) {
+    shipIcon = createShipIcon();
+  }
+  return shipIcon;
+}
+
+function buildTrailPositions(ship: Ship, position: Cartesian3) {
+  const trailHeading = ship.heading ?? ship.cog;
+  if (trailHeading == null || ship.sog <= 0.5) {
+    return null;
+  }
+
+  const trailLengthDegrees = 0.08;
+  const headingRadians = CesiumMath.toRadians(trailHeading);
+  return [
+    Cartesian3.fromDegrees(
+      ship.longitude - Math.sin(headingRadians) * trailLengthDegrees,
+      ship.latitude - Math.cos(headingRadians) * trailLengthDegrees,
+      0,
+    ),
+    position,
+  ];
+}
+
 export default function ShipLayer({ ships, visible, isTracking }: ShipLayerProps) {
   const { viewer } = useCesium();
-
-  // Backing entity map for trackedEntity camera follow
   const entityMapRef = useRef<Map<string, CesiumEntity>>(new Map());
-  // Dead-reckoned position map (CallbackProperty reads from here)
   const positionMapRef = useRef<Map<string, Cartesian3>>(new Map());
-  // Mutable ship state for dead-reckoning
-  const shipStateRef = useRef<Map<string, {
-    lat: number; lon: number;
-    heading: number | null; cog: number | null; sog: number;
-    updatedAt: number;
-  }>>(new Map());
-
-  // Persistent primitive collection refs
+  const shipStateRef = useRef<Map<string, ShipState>>(new Map());
   const collectionsRef = useRef<{
     billboards: BillboardCollection;
     labels: LabelCollection;
     trails: PolylineCollection;
   } | null>(null);
-  const primitiveMapRef = useRef<Map<string, { billboard: Billboard; label: Label }>>(new Map());
+  const primitiveMapRef = useRef<Map<string, ShipPrimitiveRefs>>(new Map());
+  const trailMapRef = useRef<Map<string, Polyline>>(new Map());
+  const lastOcclusionUpdateRef = useRef(0);
 
-  /* ── Effect 1: Create / destroy primitive collections ── */
   useEffect(() => {
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     const billboards = new BillboardCollection();
     const labels = new LabelCollection({ blendOption: BlendOption.TRANSLUCENT });
@@ -194,107 +173,107 @@ export default function ShipLayer({ ships, visible, isTracking }: ShipLayerProps
     collectionsRef.current = { billboards, labels, trails };
 
     return () => {
-      try {
-        if (!viewer.isDestroyed()) {
-          try { viewer.scene.primitives.remove(billboards); } catch { /* ok */ }
-          try { viewer.scene.primitives.remove(labels); } catch { /* ok */ }
-          try { viewer.scene.primitives.remove(trails); } catch { /* ok */ }
-        }
-      } catch { /* viewer may be destroyed during HMR */ }
+      if (!viewer.isDestroyed()) {
+        viewer.scene.primitives.remove(billboards);
+        viewer.scene.primitives.remove(labels);
+        viewer.scene.primitives.remove(trails);
+        entityMapRef.current.forEach((entity) => {
+          try {
+            viewer.entities.remove(entity);
+          } catch {
+            // Best-effort cleanup.
+          }
+        });
+      }
+
       collectionsRef.current = null;
       primitiveMapRef.current.clear();
+      trailMapRef.current.clear();
+      entityMapRef.current.clear();
+      positionMapRef.current.clear();
+      shipStateRef.current.clear();
     };
   }, [viewer]);
 
-  /* ── Effect 2: Sync ship data into primitives ── */
   useEffect(() => {
-    const cols = collectionsRef.current;
-    let viewerOk = false;
-    try { viewerOk = !!viewer && !viewer.isDestroyed(); } catch { /* */ }
-    if (!viewerOk || !cols) return;
-
-    // Rebuild trails each refresh
-    try {
-      cols.trails.show = false;
-      cols.trails.removeAll();
-    } catch { return; }
-
-    if (!visible || ships.length === 0) {
-      try {
-        cols.billboards.removeAll();
-        cols.labels.removeAll();
-      } catch { /* destroyed */ }
-      primitiveMapRef.current.clear();
+    const collections = collectionsRef.current;
+    if (!viewer || viewer.isDestroyed() || !collections) {
       return;
     }
 
-    const activeMMSIs = new Set<string>();
+    const startedAt = performance.now();
 
-    for (const s of ships) {
-      const category = getShipCategory(s.shipType);
+    if (!visible || ships.length === 0) {
+      collections.billboards.removeAll();
+      collections.labels.removeAll();
+      collections.trails.removeAll();
+      primitiveMapRef.current.clear();
+      trailMapRef.current.clear();
+      recordLayerPerformance('ships', {
+        updateMs: performance.now() - startedAt,
+        primitives: 0,
+        visibleCount: 0,
+      });
+      return;
+    }
+
+    const activeMmsis = new Set<string>();
+
+    for (const ship of ships) {
+      activeMmsis.add(ship.mmsi);
+
+      const category = getShipCategory(ship.shipType);
       const color = getShipColor(category);
-      const position = Cartesian3.fromDegrees(s.longitude, s.latitude, 0);
-      const headingDeg = s.heading ?? s.cog ?? null;
-      const rotation = headingDeg != null ? -CesiumMath.toRadians(headingDeg) : 0;
+      const position = Cartesian3.fromDegrees(ship.longitude, ship.latitude, 0);
+      const heading = ship.heading ?? ship.cog ?? null;
+      const rotation = heading != null ? -CesiumMath.toRadians(heading) : 0;
+      const labelText = `${ship.name || ship.mmsi} ${ship.sog.toFixed(1)}kt ${ship.destination || ''}`.trim();
 
-      const nameLabel = s.name || s.mmsi;
-      const speedLabel = s.sog != null ? `${s.sog.toFixed(1)}kt` : '';
-      const destLabel = s.destination ? `→${s.destination}` : '';
-      const fullLabel = `${nameLabel} ${speedLabel} ${destLabel}`.trim();
-
-      activeMMSIs.add(s.mmsi);
-
-      // Update dead-reckoning state
-      shipStateRef.current.set(s.mmsi, {
-        lat: s.latitude, lon: s.longitude,
-        heading: s.heading, cog: s.cog, sog: s.sog,
+      positionMapRef.current.set(ship.mmsi, position);
+      shipStateRef.current.set(ship.mmsi, {
+        lat: ship.latitude,
+        lon: ship.longitude,
+        heading: ship.heading,
+        cog: ship.cog,
+        sog: ship.sog,
         updatedAt: Date.now(),
       });
 
-      // Update position map for CallbackProperty
-      positionMapRef.current.set(s.mmsi, position);
-
-      // Backing entity for tracked-entity camera follow
-      let backingEntity = entityMapRef.current.get(s.mmsi);
+      let backingEntity = entityMapRef.current.get(ship.mmsi);
       if (!backingEntity) {
-        try { if (viewer!.isDestroyed()) break; } catch { break; }
-
-        const mmsi = s.mmsi;
+        const mmsi = ship.mmsi;
         backingEntity = new CesiumEntity({
-          id: `ship-${s.mmsi}`,
-          name: nameLabel,
+          id: `ship-${ship.mmsi}`,
+          name: ship.name || ship.mmsi,
           position: new CallbackProperty(
             () => positionMapRef.current.get(mmsi) ?? position,
             false,
           ) as unknown as never,
-          description: new ConstantProperty(buildShipDescription(s, category)),
+          description: new ConstantProperty(buildShipDescription(ship, category)),
           point: {
             pixelSize: 1,
             color: Color.TRANSPARENT,
           },
         });
-        try {
-          viewer!.entities.add(backingEntity);
-        } catch { break; }
-        entityMapRef.current.set(s.mmsi, backingEntity);
+        viewer.entities.add(backingEntity);
+        entityMapRef.current.set(ship.mmsi, backingEntity);
       } else {
-        backingEntity.name = nameLabel;
-        try {
-          (backingEntity.description as ConstantProperty).setValue(buildShipDescription(s, category));
-        } catch { /* entity may be destroyed */ }
+        backingEntity.name = ship.name || ship.mmsi;
+        (backingEntity.description as ConstantProperty).setValue(buildShipDescription(ship, category));
       }
 
-      // Billboard + Label: create or update in-place
-      const existing = primitiveMapRef.current.get(s.mmsi);
+      const existing = primitiveMapRef.current.get(ship.mmsi);
       if (existing) {
         existing.billboard.position = position;
         existing.billboard.color = color;
         existing.billboard.rotation = rotation;
+        existing.billboard.id = backingEntity;
         existing.label.position = position;
-        existing.label.text = fullLabel;
+        existing.label.text = labelText;
         existing.label.fillColor = color.withAlpha(0.85);
+        existing.label.id = backingEntity;
       } else {
-        const billboard = cols.billboards.add({
+        const billboard = collections.billboards.add({
           position,
           image: getShipIcon(),
           color,
@@ -307,9 +286,9 @@ export default function ShipLayer({ ships, visible, isTracking }: ShipLayerProps
           disableDepthTestDistance: 0,
           id: backingEntity,
         });
-        const label = cols.labels.add({
+        const label = collections.labels.add({
           position,
-          text: fullLabel,
+          text: labelText,
           font: '8px monospace',
           fillColor: color.withAlpha(0.85),
           outlineColor: Color.BLACK,
@@ -322,208 +301,197 @@ export default function ShipLayer({ ships, visible, isTracking }: ShipLayerProps
           disableDepthTestDistance: 0,
           id: backingEntity,
         });
-        primitiveMapRef.current.set(s.mmsi, { billboard, label });
+        primitiveMapRef.current.set(ship.mmsi, { billboard, label });
       }
 
-      // Far-side occlusion
-      if (viewer) {
-        const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
-        const vis = occluder.isPointVisible(position);
-        const prims = primitiveMapRef.current.get(s.mmsi);
-        if (prims) {
-          prims.billboard.show = vis;
-          prims.label.show = vis && !isTracking;
+      const trailPositions = buildTrailPositions(ship, position);
+      const trail = trailMapRef.current.get(ship.mmsi);
+      if (trailPositions) {
+        if (trail) {
+          trail.positions = trailPositions;
+          trail.show = true;
+        } else {
+          trailMapRef.current.set(
+            ship.mmsi,
+            collections.trails.add({
+              positions: trailPositions,
+              width: 1.5,
+              material: Material.fromType('Color', { color: color.withAlpha(TRAIL_ALPHA) }),
+            }),
+          );
         }
-      }
-
-      // Heading trail (short wake-like line behind the vessel)
-      const trailHeading = s.heading ?? s.cog;
-      if (trailHeading != null && s.sog > 0.5) {
-        try {
-          const trailLenDeg = 0.08;
-          const headRad = CesiumMath.toRadians(trailHeading);
-          const dLat = -Math.cos(headRad) * trailLenDeg;
-          const dLon = -Math.sin(headRad) * trailLenDeg;
-          cols.trails.add({
-            positions: [
-              Cartesian3.fromDegrees(s.longitude + dLon, s.latitude + dLat, 0),
-              position,
-            ],
-            width: 1.5,
-            material: Material.fromType('Color', { color: color.withAlpha(TRAIL_ALPHA) }),
-          });
-        } catch { /* skip bad trail */ }
+      } else if (trail) {
+        collections.trails.remove(trail);
+        trailMapRef.current.delete(ship.mmsi);
       }
     }
 
-    // Remove stale primitives
-    for (const [mmsi, prims] of primitiveMapRef.current) {
-      if (!activeMMSIs.has(mmsi)) {
-        try { cols.billboards.remove(prims.billboard); } catch { /* ok */ }
-        try { cols.labels.remove(prims.label); } catch { /* ok */ }
+    for (const [mmsi, primitives] of primitiveMapRef.current) {
+      if (!activeMmsis.has(mmsi)) {
+        collections.billboards.remove(primitives.billboard);
+        collections.labels.remove(primitives.label);
         primitiveMapRef.current.delete(mmsi);
       }
     }
 
-    // Prune backing entities
+    for (const [mmsi, trail] of trailMapRef.current) {
+      if (!activeMmsis.has(mmsi)) {
+        collections.trails.remove(trail);
+        trailMapRef.current.delete(mmsi);
+      }
+    }
+
     entityMapRef.current.forEach((entity, mmsi) => {
-      if (!activeMMSIs.has(mmsi)) {
-        try {
-          if (viewer!.trackedEntity !== entity) {
-            viewer!.entities.remove(entity);
-          }
-        } catch { /* viewer may be destroyed */ }
-        if (viewer!.trackedEntity !== entity) {
-          entityMapRef.current.delete(mmsi);
-          positionMapRef.current.delete(mmsi);
-          shipStateRef.current.delete(mmsi);
-        }
+      if (!activeMmsis.has(mmsi) && viewer.trackedEntity !== entity) {
+        viewer.entities.remove(entity);
+        entityMapRef.current.delete(mmsi);
+        positionMapRef.current.delete(mmsi);
+        shipStateRef.current.delete(mmsi);
       }
     });
 
-    // Restore trail visibility
-    try {
-      cols.trails.show = visible;
-    } catch { /* ok */ }
-  }, [viewer, ships, visible]);
+    recordLayerPerformance('ships', {
+      updateMs: performance.now() - startedAt,
+      primitives: primitiveMapRef.current.size * 2 + trailMapRef.current.size,
+      visibleCount: activeMmsis.size,
+    });
+  }, [ships, viewer, visible]);
 
-  /* ── Effect 3: Visibility toggling ── */
   useEffect(() => {
-    const cols = collectionsRef.current;
-    if (!cols) return;
-    cols.billboards.show = visible;
-    cols.labels.show = visible && !isTracking;
-    cols.trails.show = visible;
-  }, [visible, isTracking]);
+    const collections = collectionsRef.current;
+    if (!collections) {
+      return;
+    }
 
-  /* ── Effect 4: Dead-reckoning via preUpdate ── */
+    collections.billboards.show = visible;
+    collections.labels.show = visible && !isTracking;
+    collections.trails.show = visible;
+  }, [isTracking, visible]);
+
   useEffect(() => {
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     let lastBulkUpdate = 0;
-    const BULK_MS = 2000; // Ships move slowly — 2s is fine
+    const bulkMs = 2_000;
 
     const onPreUpdate = () => {
-      try { if (viewer.isDestroyed()) return; } catch { return; }
+      if (viewer.isDestroyed()) {
+        return;
+      }
 
       const now = Date.now();
       const tracked = viewer.trackedEntity;
-
-      // Occlusion + tracked scale
-      const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
       const trackedId = tracked && typeof tracked.id === 'string' && tracked.id.startsWith('ship-')
-        ? tracked.id.slice(5) : null;
+        ? tracked.id.slice(5)
+        : null;
+      const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
+      const shouldRefreshOcclusion = now - lastOcclusionUpdateRef.current >= 220;
 
-      for (const [mmsi, prims] of primitiveMapRef.current) {
-        const pos = positionMapRef.current.get(mmsi);
-        if (pos) {
-          const vis = occluder.isPointVisible(pos);
-          prims.billboard.show = vis;
-          prims.label.show = vis;
-        }
+      if (shouldRefreshOcclusion) {
+        lastOcclusionUpdateRef.current = now;
+      }
+
+      for (const [mmsi, primitives] of primitiveMapRef.current) {
+        const position = positionMapRef.current.get(mmsi);
         if (mmsi === trackedId) {
-          prims.billboard.scale = TRACKED_SCALE;
-          // Render on top of globe so the icon is never clipped
-          prims.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
-          prims.billboard.alignedAxis = Cartesian3.ZERO;
-          const st = shipStateRef.current.get(mmsi);
-          const hdg = st?.heading ?? st?.cog;
-          if (hdg != null) {
-            prims.billboard.rotation = viewer.camera.heading - CesiumMath.toRadians(hdg);
+          primitives.billboard.scale = TRACKED_SCALE;
+          primitives.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
+          primitives.billboard.alignedAxis = Cartesian3.ZERO;
+          primitives.billboard.show = true;
+          primitives.label.show = false;
+
+          const state = shipStateRef.current.get(mmsi);
+          const heading = state?.heading ?? state?.cog;
+          if (heading != null) {
+            primitives.billboard.rotation = viewer.camera.heading - CesiumMath.toRadians(heading);
           }
-        } else {
-          prims.billboard.disableDepthTestDistance = 0;
-          prims.billboard.alignedAxis = Cartesian3.UNIT_Z;
-          prims.billboard.scale = 0.4;
+          continue;
+        }
+
+        primitives.billboard.scale = 0.4;
+        primitives.billboard.disableDepthTestDistance = 0;
+        primitives.billboard.alignedAxis = Cartesian3.UNIT_Z;
+
+        if (position && shouldRefreshOcclusion) {
+          const visibleToCamera = occluder.isPointVisible(position);
+          primitives.billboard.show = visibleToCamera;
+          primitives.label.show = visibleToCamera && !isTracking;
         }
       }
 
-      // Tracked ship: dead-reckon every frame
       if (tracked && typeof tracked.id === 'string' && tracked.id.startsWith('ship-')) {
         const mmsi = tracked.id.slice(5);
         const state = shipStateRef.current.get(mmsi);
         if (state) {
-          const dtSec = (now - state.updatedAt) / 1000;
-          let lat = state.lat;
-          let lon = state.lon;
-          const hdg = state.heading ?? state.cog;
-          if (hdg != null && state.sog > 0.5 && dtSec > 0 && dtSec < 300) {
+          const dtSeconds = (now - state.updatedAt) / 1000;
+          const heading = state.heading ?? state.cog;
+          let latitude = state.lat;
+          let longitude = state.lon;
+
+          if (heading != null && state.sog > 0.5 && dtSeconds > 0 && dtSeconds < 300) {
             const speedMps = state.sog * 0.514444;
-            const headRad = CesiumMath.toRadians(hdg);
-            lat += (Math.cos(headRad) * speedMps * dtSec) / 111320;
-            const cosLat = Math.cos(lat * (Math.PI / 180)) || 0.0001;
-            lon += (Math.sin(headRad) * speedMps * dtSec) / (111320 * cosLat);
+            const headingRadians = CesiumMath.toRadians(heading);
+            latitude += (Math.cos(headingRadians) * speedMps * dtSeconds) / 111320;
+            const cosLatitude = Math.cos(latitude * (Math.PI / 180)) || 0.0001;
+            longitude += (Math.sin(headingRadians) * speedMps * dtSeconds) / (111320 * cosLatitude);
           }
-          const pos = Cartesian3.fromDegrees(lon, lat, 0);
-          positionMapRef.current.set(mmsi, pos);
-          const prims = primitiveMapRef.current.get(mmsi);
-          if (prims) {
-            try {
-              prims.billboard.position = pos;
-              prims.label.position = pos;
-            } catch { /* ok */ }
+
+          const position = Cartesian3.fromDegrees(longitude, latitude, 0);
+          positionMapRef.current.set(mmsi, position);
+          const primitives = primitiveMapRef.current.get(mmsi);
+          if (primitives) {
+            primitives.billboard.position = position;
+            primitives.label.position = position;
           }
         }
       }
 
-      // Bulk dead-reckon others
-      if (now - lastBulkUpdate >= BULK_MS) {
+      if (now - lastBulkUpdate >= bulkMs) {
         lastBulkUpdate = now;
-        const trackedMMSI = tracked && typeof tracked.id === 'string' && tracked.id.startsWith('ship-')
-          ? tracked.id.slice(5) : null;
-
-        for (const [mmsi, prims] of primitiveMapRef.current) {
-          if (mmsi === trackedMMSI) continue;
-          const state = shipStateRef.current.get(mmsi);
-          if (!state) continue;
-          const dtSec = (now - state.updatedAt) / 1000;
-          if (dtSec <= 0 || dtSec > 300) continue;
-
-          let lat = state.lat;
-          let lon = state.lon;
-          const hdg = state.heading ?? state.cog;
-          if (hdg != null && state.sog > 0.5) {
-            const speedMps = state.sog * 0.514444;
-            const headRad = CesiumMath.toRadians(hdg);
-            lat += (Math.cos(headRad) * speedMps * dtSec) / 111320;
-            const cosLat = Math.cos(lat * (Math.PI / 180)) || 0.0001;
-            lon += (Math.sin(headRad) * speedMps * dtSec) / (111320 * cosLat);
+        for (const [mmsi, primitives] of primitiveMapRef.current) {
+          if (mmsi === trackedId) {
+            continue;
           }
-          const pos = Cartesian3.fromDegrees(lon, lat, 0);
-          positionMapRef.current.set(mmsi, pos);
-          try {
-            prims.billboard.position = pos;
-            prims.label.position = pos;
-          } catch { /* ok */ }
+
+          const state = shipStateRef.current.get(mmsi);
+          if (!state) {
+            continue;
+          }
+
+          const dtSeconds = (now - state.updatedAt) / 1000;
+          if (dtSeconds <= 0 || dtSeconds > 300) {
+            continue;
+          }
+
+          const heading = state.heading ?? state.cog;
+          let latitude = state.lat;
+          let longitude = state.lon;
+
+          if (heading != null && state.sog > 0.5) {
+            const speedMps = state.sog * 0.514444;
+            const headingRadians = CesiumMath.toRadians(heading);
+            latitude += (Math.cos(headingRadians) * speedMps * dtSeconds) / 111320;
+            const cosLatitude = Math.cos(latitude * (Math.PI / 180)) || 0.0001;
+            longitude += (Math.sin(headingRadians) * speedMps * dtSeconds) / (111320 * cosLatitude);
+          }
+
+          const position = Cartesian3.fromDegrees(longitude, latitude, 0);
+          positionMapRef.current.set(mmsi, position);
+          primitives.billboard.position = position;
+          primitives.label.position = position;
         }
       }
     };
 
     viewer.scene.preUpdate.addEventListener(onPreUpdate);
     return () => {
-      try {
-        if (!viewer.isDestroyed()) {
-          viewer.scene.preUpdate.removeEventListener(onPreUpdate);
-        }
-      } catch { /* ok */ }
+      if (!viewer.isDestroyed()) {
+        viewer.scene.preUpdate.removeEventListener(onPreUpdate);
+      }
     };
-  }, [viewer]);
-
-  // Cleanup backing entities on unmount
-  useEffect(() => {
-    return () => {
-      try {
-        if (viewer && !viewer.isDestroyed()) {
-          entityMapRef.current.forEach((entity) => {
-            try { viewer.entities.remove(entity); } catch { /* ok */ }
-          });
-        }
-      } catch { /* ok */ }
-      entityMapRef.current.clear();
-      positionMapRef.current.clear();
-      shipStateRef.current.clear();
-    };
-  }, [viewer]);
+  }, [isTracking, viewer]);
 
   return null;
 }

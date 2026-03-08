@@ -3,9 +3,9 @@ import { access } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Builder, By, until } from 'selenium-webdriver';
+import { getTauriBinaryPath, getTauriEnv } from '../../scripts/tauri-runner.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const appBinary = path.join(rootDir, 'src-tauri', 'target', 'debug', process.platform === 'win32' ? 'tac_view.exe' : 'tac_view');
 
 function spawnChecked(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -48,6 +48,12 @@ async function waitForAppRoot(driver, timeoutMs = 90_000) {
   }
 
   throw new Error('Timed out waiting for the TAC_VIEW app root');
+}
+
+async function clickByLabel(driver, label) {
+  const element = await driver.findElement(By.xpath(`//*[contains(text(), '${label}')]`));
+  await driver.executeScript('arguments[0].scrollIntoView({block: "center"});', element);
+  await element.click();
 }
 
 async function cleanupDesktopProcesses() {
@@ -139,11 +145,12 @@ async function main() {
   }
 
   await spawnChecked('npx', ['tauri', 'build', '--debug', '--no-bundle'], {
-    env: {
+    env: getTauriEnv({
       ...process.env,
       PATH: [path.dirname(cargoPath), process.env.PATH].filter(Boolean).join(path.delimiter),
-    },
+    }),
   });
+  const appBinary = getTauriBinaryPath({ profile: 'debug' });
   await access(appBinary);
 
   const tauriDriver = spawn(tauriDriverPath, ['--native-driver', nativeDriverPath], {
@@ -169,7 +176,6 @@ async function main() {
     await waitForAppRoot(driver);
 
     await driver.wait(until.elementLocated(By.css('[data-testid="operations-panel"]')), 60_000);
-    await driver.wait(until.elementLocated(By.css('[data-testid="cctv-panel"]')), 60_000);
     await driver.wait(until.elementLocated(By.css('[data-testid="audio-toggle"]')), 60_000);
 
     const operationsText = await driver.findElement(By.css('[data-testid="operations-panel"]')).getText();
@@ -179,6 +185,25 @@ async function main() {
 
     await driver.findElement(By.xpath("//*[contains(text(), 'CRT')]")).click();
     await driver.findElement(By.xpath("//*[contains(text(), 'OSM')]")).click();
+    await clickByLabel(driver, 'LIVE FLIGHTS');
+    await clickByLabel(driver, 'SATELLITES');
+    await clickByLabel(driver, 'SEISMIC');
+    await clickByLabel(driver, 'STREET TRAFFIC');
+    await clickByLabel(driver, 'CCTV FEEDS');
+    await clickByLabel(driver, 'NAVAL / AIS');
+    await delay(1500);
+
+    const performanceSnapshot = await driver.executeScript('return window.__TAC_VIEW_PERFORMANCE__ || null;');
+    if (!performanceSnapshot || typeof performanceSnapshot.fps !== 'number') {
+      throw new Error('performance snapshot was not published to the desktop window');
+    }
+    if (performanceSnapshot.resolutionScale < 0.75) {
+      throw new Error(`unexpected resolution scale floor: ${performanceSnapshot.resolutionScale}`);
+    }
+    if (performanceSnapshot.fps <= 0) {
+      throw new Error(`invalid fps reading: ${performanceSnapshot.fps}`);
+    }
+
     await driver.findElement(By.css('[data-testid="audio-toggle"]')).click();
   } finally {
     if (driver) {

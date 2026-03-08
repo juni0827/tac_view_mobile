@@ -1,55 +1,60 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
-import { Entity, BillboardGraphics, LabelGraphics, PolylineGraphics, useCesium } from 'resium';
+import { useEffect, useRef } from 'react';
+import { useCesium } from 'resium';
 import {
-  ArcType,
+  Billboard,
+  BillboardCollection,
+  BlendOption,
   CallbackProperty,
   Cartesian2,
   Cartesian3,
   Color,
-  ColorMaterialProperty,
+  DistanceDisplayCondition,
   Ellipsoid,
+  Entity as CesiumEntity,
   HorizontalOrigin,
+  Label,
+  LabelCollection,
   LabelStyle,
   Math as CesiumMath,
   NearFarScalar,
-  PolylineDashMaterialProperty,
+  Polyline,
+  PolylineCollection,
   VerticalOrigin,
 } from 'cesium';
 import * as Cesium from 'cesium';
-import { degreesLat, degreesLong, eciToGeodetic, gstime, propagate } from 'satellite.js';
 import type { SatellitePosition } from '../../hooks/useSatellites';
+import { normalizeLongitude } from '../../lib/cesiumSafety';
+import { recordLayerPerformance } from '../../lib/performanceStore';
 
-const EllipsoidalOccluder = (Cesium as unknown as { EllipsoidalOccluder: new (
-  ellipsoid: typeof Ellipsoid.WGS84,
-  cameraPosition: Cartesian3,
-) => { isPointVisible(point: Cartesian3): boolean } }).EllipsoidalOccluder;
+const EllipsoidalOccluder = (Cesium as unknown as {
+  EllipsoidalOccluder: new (
+    ellipsoid: typeof Ellipsoid.WGS84,
+    cameraPosition: Cartesian3,
+  ) => { isPointVisible(point: Cartesian3): boolean };
+}).EllipsoidalOccluder;
 
 const SAT_COLOR_ISS = Color.fromCssColorString('#00D4FF');
 const SAT_COLOR_DEFAULT = Color.fromCssColorString('#39FF14');
 
 export type SatelliteCategory = 'iss' | 'other';
 
-class MutableSatelliteState {
-  satrec: SatellitePosition['satrec'] | null = null;
-  position = Cartesian3.ZERO;
-  heading = 0;
-
-  reset(sat: SatellitePosition) {
-    this.satrec = sat.satrec;
-    this.position = Cartesian3.fromDegrees(sat.longitude, sat.latitude, sat.altitude * 1000);
-    this.heading = 0;
-  }
-
-  updatePosition(position: Cartesian3) {
-    this.position = position;
-  }
-
-  updateHeading(heading: number) {
-    this.heading = heading;
-  }
+interface SatelliteLayerProps {
+  satellites: SatellitePosition[];
+  visible: boolean;
+  showPaths: boolean;
+  categoryFilter: Record<SatelliteCategory, boolean>;
+  isTracking?: boolean;
 }
 
-function createSatelliteIcon(): HTMLCanvasElement {
+interface SatellitePrimitiveRefs {
+  billboard: Billboard;
+  label: Label;
+  orbit?: Polyline;
+  groundTrack?: Polyline;
+  nadir?: Polyline;
+}
+
+function createSatelliteIcon() {
   const size = 32;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -61,7 +66,6 @@ function createSatelliteIcon(): HTMLCanvasElement {
 
   const centerX = size / 2;
   const centerY = size / 2;
-
   context.fillStyle = '#FFFFFF';
   context.strokeStyle = '#FFFFFF';
   context.lineWidth = 1.2;
@@ -84,52 +88,29 @@ function createSatelliteIcon(): HTMLCanvasElement {
   context.lineTo(centerX + 14, centerY);
   context.stroke();
 
-  context.lineWidth = 0.5;
-  context.strokeStyle = 'rgba(0,0,0,0.3)';
-  for (let index = 1; index < 3; index += 1) {
-    context.beginPath();
-    context.moveTo(centerX - 14 + index * 3, centerY - 3);
-    context.lineTo(centerX - 14 + index * 3, centerY + 3);
-    context.moveTo(centerX + 5 + index * 3, centerY - 3);
-    context.lineTo(centerX + 5 + index * 3, centerY + 3);
-    context.stroke();
-  }
-
-  context.fillStyle = '#FFFFFF';
-  context.beginPath();
-  context.moveTo(centerX, centerY - 10);
-  context.lineTo(centerX + 2, centerY - 7);
-  context.lineTo(centerX - 2, centerY - 7);
-  context.closePath();
-  context.fill();
-
   return canvas;
 }
 
 let satelliteIcon: HTMLCanvasElement | null = null;
-function getSatelliteIcon(): HTMLCanvasElement {
+function getSatelliteIcon() {
   if (!satelliteIcon) {
     satelliteIcon = createSatelliteIcon();
   }
   return satelliteIcon;
 }
 
-function computeBearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const deltaLon = (lon2 - lon1) * Math.PI / 180;
-  const lat1Rad = lat1 * Math.PI / 180;
-  const lat2Rad = lat2 * Math.PI / 180;
+function computeBearing(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const deltaLon = ((lon2 - lon1) * Math.PI) / 180;
+  const lat1Rad = (lat1 * Math.PI) / 180;
+  const lat2Rad = (lat2 * Math.PI) / 180;
   const y = Math.sin(deltaLon) * Math.cos(lat2Rad);
   const x = Math.cos(lat1Rad) * Math.sin(lat2Rad)
     - Math.sin(lat1Rad) * Math.cos(lat2Rad) * Math.cos(deltaLon);
   return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
 }
 
-interface SatelliteLayerProps {
-  satellites: SatellitePosition[];
-  visible: boolean;
-  showPaths: boolean;
-  categoryFilter: Record<SatelliteCategory, boolean>;
-  isTracking?: boolean;
+function isIssSatellite(satellite: SatellitePosition) {
+  return satellite.name.includes('ISS') || satellite.noradId === 25544;
 }
 
 export default function SatelliteLayer({
@@ -137,224 +118,328 @@ export default function SatelliteLayer({
   visible,
   showPaths,
   categoryFilter,
-  isTracking,
+  isTracking = false,
 }: SatelliteLayerProps) {
-  if (!visible || satellites.length === 0) {
-    return null;
-  }
-
-  return (
-    <>
-      {satellites.map((satellite) => {
-        const isIss = satellite.name.includes('ISS') || satellite.noradId === 25544;
-        const category: SatelliteCategory = isIss ? 'iss' : 'other';
-        if (!categoryFilter[category]) {
-          return null;
-        }
-
-        return (
-          <MemoSatelliteEntity
-            key={satellite.noradId}
-            sat={satellite}
-            color={isIss ? SAT_COLOR_ISS : SAT_COLOR_DEFAULT}
-            scale={isIss ? 0.6 : 0.35}
-            isIss={isIss}
-            hideLabel={Boolean(isTracking)}
-            showPaths={showPaths}
-            isTracked={Boolean(isTracking)}
-          />
-        );
-      })}
-    </>
-  );
-}
-
-const MemoSatelliteEntity = memo(function SatelliteEntity({
-  sat,
-  color,
-  scale,
-  isIss,
-  hideLabel,
-  showPaths,
-  isTracked,
-}: {
-  sat: SatellitePosition;
-  color: Color;
-  scale: number;
-  isIss: boolean;
-  hideLabel: boolean;
-  showPaths: boolean;
-  isTracked: boolean;
-}) {
-  const orbitPositions = useMemo(() => {
-    if (!sat.orbitPath || sat.orbitPath.length < 2) {
-      return null;
-    }
-
-    return sat.orbitPath.map((point) =>
-      Cartesian3.fromDegrees(point.longitude, point.latitude, point.altitude * 1000),
-    );
-  }, [sat.orbitPath]);
-
-  const groundTrackPositions = useMemo(() => {
-    if (!sat.orbitPath || sat.orbitPath.length < 2) {
-      return null;
-    }
-
-    return sat.orbitPath.map((point) =>
-      Cartesian3.fromDegrees(point.longitude, point.latitude, 0),
-    );
-  }, [sat.orbitPath]);
-
   const { viewer } = useCesium();
-  const [isFarSide, setIsFarSide] = useState(false);
-  const isFarSideRef = useRef(false);
-  const [dynamicState] = useState(() => {
-    const state = new MutableSatelliteState();
-    state.reset(sat);
-    return state;
-  });
+  const collectionsRef = useRef<{
+    billboards: BillboardCollection;
+    labels: LabelCollection;
+    orbits: PolylineCollection;
+    groundTracks: PolylineCollection;
+    nadirs: PolylineCollection;
+  } | null>(null);
+  const primitiveMapRef = useRef<Map<number, SatellitePrimitiveRefs>>(new Map());
+  const entityMapRef = useRef<Map<number, CesiumEntity>>(new Map());
+  const positionMapRef = useRef<Map<number, Cartesian3>>(new Map());
+  const headingMapRef = useRef<Map<number, number>>(new Map());
+  const scaleMapRef = useRef<Map<number, number>>(new Map());
+  const lastOcclusionUpdateRef = useRef(0);
 
   useEffect(() => {
-    dynamicState.reset(sat);
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
-    const updatePosition = () => {
-      try {
-        const now = new Date();
-        const gmst = gstime(now);
-        if (!dynamicState.satrec) {
-          return;
-        }
+    const billboards = new BillboardCollection();
+    const labels = new LabelCollection({ blendOption: BlendOption.TRANSLUCENT });
+    const orbits = new PolylineCollection();
+    const groundTracks = new PolylineCollection();
+    const nadirs = new PolylineCollection();
 
-        const propagation = propagate(dynamicState.satrec, now);
-        if (!propagation || typeof propagation.position === 'boolean' || !propagation.position) {
-          return;
-        }
+    viewer.scene.primitives.add(billboards);
+    viewer.scene.primitives.add(labels);
+    viewer.scene.primitives.add(orbits);
+    viewer.scene.primitives.add(groundTracks);
+    viewer.scene.primitives.add(nadirs);
 
-        const geo = eciToGeodetic(propagation.position, gmst);
-        const lat = degreesLat(geo.latitude);
-        const lon = degreesLong(geo.longitude);
-        dynamicState.updatePosition(Cartesian3.fromDegrees(lon, lat, geo.height * 1000));
+    collectionsRef.current = { billboards, labels, orbits, groundTracks, nadirs };
 
-        const future = new Date(now.getTime() + 10_000);
-        const futureGmst = gstime(future);
-        const futurePropagation = propagate(dynamicState.satrec, future);
-        if (futurePropagation && typeof futurePropagation.position !== 'boolean' && futurePropagation.position) {
-          const futureGeo = eciToGeodetic(futurePropagation.position, futureGmst);
-          dynamicState.updateHeading(computeBearing(
-            lat,
-            lon,
-            degreesLat(futureGeo.latitude),
-            degreesLong(futureGeo.longitude),
-          ));
-        }
-
-        if (viewer && !viewer.isDestroyed()) {
-          const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
-          const hidden = !occluder.isPointVisible(dynamicState.position);
-          if (hidden !== isFarSideRef.current) {
-            isFarSideRef.current = hidden;
-            setIsFarSide(hidden);
+    return () => {
+      if (!viewer.isDestroyed()) {
+        viewer.scene.primitives.remove(billboards);
+        viewer.scene.primitives.remove(labels);
+        viewer.scene.primitives.remove(orbits);
+        viewer.scene.primitives.remove(groundTracks);
+        viewer.scene.primitives.remove(nadirs);
+        entityMapRef.current.forEach((entity) => {
+          try {
+            viewer.entities.remove(entity);
+          } catch {
+            // Best-effort cleanup.
           }
+        });
+      }
+
+      collectionsRef.current = null;
+      primitiveMapRef.current.clear();
+      entityMapRef.current.clear();
+      positionMapRef.current.clear();
+      headingMapRef.current.clear();
+      scaleMapRef.current.clear();
+    };
+  }, [viewer]);
+
+  useEffect(() => {
+    const collections = collectionsRef.current;
+    if (!viewer || viewer.isDestroyed() || !collections) {
+      return;
+    }
+
+    const startedAt = performance.now();
+    const filtered = visible
+      ? satellites.filter((satellite) => {
+        const category: SatelliteCategory = isIssSatellite(satellite) ? 'iss' : 'other';
+        return categoryFilter[category];
+      })
+      : [];
+    const activeIds = new Set(filtered.map((satellite) => satellite.noradId));
+
+    for (const [noradId, primitives] of primitiveMapRef.current) {
+      if (!activeIds.has(noradId)) {
+        collections.billboards.remove(primitives.billboard);
+        collections.labels.remove(primitives.label);
+        if (primitives.orbit) collections.orbits.remove(primitives.orbit);
+        if (primitives.groundTrack) collections.groundTracks.remove(primitives.groundTrack);
+        if (primitives.nadir) collections.nadirs.remove(primitives.nadir);
+        primitiveMapRef.current.delete(noradId);
+      }
+    }
+
+    for (const [noradId, entity] of entityMapRef.current) {
+      if (!activeIds.has(noradId)) {
+        viewer.entities.remove(entity);
+        entityMapRef.current.delete(noradId);
+        positionMapRef.current.delete(noradId);
+        headingMapRef.current.delete(noradId);
+        scaleMapRef.current.delete(noradId);
+      }
+    }
+
+    for (const satellite of filtered) {
+      const isIss = isIssSatellite(satellite);
+      const color = isIss ? SAT_COLOR_ISS : SAT_COLOR_DEFAULT;
+      const scale = isIss ? 0.6 : 0.35;
+      scaleMapRef.current.set(satellite.noradId, scale);
+      const position = Cartesian3.fromDegrees(
+        normalizeLongitude(satellite.longitude),
+        satellite.latitude,
+        satellite.altitude * 1000,
+      );
+
+      positionMapRef.current.set(satellite.noradId, position);
+
+      const orbitPath = satellite.orbitPath ?? [];
+      const heading = orbitPath.length >= 2
+        ? computeBearing(
+          orbitPath[0]!.latitude,
+          orbitPath[0]!.longitude,
+          orbitPath[1]!.latitude,
+          orbitPath[1]!.longitude,
+        )
+        : headingMapRef.current.get(satellite.noradId) ?? 0;
+      headingMapRef.current.set(satellite.noradId, heading);
+
+      let backingEntity = entityMapRef.current.get(satellite.noradId);
+      if (!backingEntity) {
+        const noradId = satellite.noradId;
+        backingEntity = new CesiumEntity({
+          id: `sat-${satellite.noradId}`,
+          name: satellite.name,
+          position: new CallbackProperty(
+            () => positionMapRef.current.get(noradId) ?? position,
+            false,
+          ) as unknown as never,
+          description: [
+            `<p><b>NORAD ID:</b> ${satellite.noradId}</p>`,
+            `<p><b>Altitude:</b> ${satellite.altitude.toFixed(1)} km</p>`,
+            `<p><b>Lat:</b> ${satellite.latitude.toFixed(4)} deg</p>`,
+            `<p><b>Lon:</b> ${satellite.longitude.toFixed(4)} deg</p>`,
+          ].join(''),
+          point: {
+            pixelSize: 1,
+            color: Color.TRANSPARENT,
+          },
+        });
+        viewer.entities.add(backingEntity);
+        entityMapRef.current.set(satellite.noradId, backingEntity);
+      } else {
+        backingEntity.name = satellite.name;
+      }
+
+      const primitives = primitiveMapRef.current.get(satellite.noradId);
+      if (primitives) {
+        primitives.billboard.position = position;
+        primitives.billboard.color = color;
+        primitives.billboard.rotation = -CesiumMath.toRadians(heading);
+        primitives.billboard.scale = isTracking ? 1.0 : scale;
+        primitives.billboard.id = backingEntity;
+        primitives.label.position = position;
+        primitives.label.text = satellite.name;
+        primitives.label.fillColor = color.withAlpha(0.8);
+        primitives.label.show = !isTracking;
+      } else {
+        const billboard = collections.billboards.add({
+          position,
+          image: getSatelliteIcon(),
+          color,
+          scale: isTracking ? 1.0 : scale,
+          rotation: -CesiumMath.toRadians(heading),
+          alignedAxis: Cartesian3.UNIT_Z,
+          horizontalOrigin: HorizontalOrigin.CENTER,
+          verticalOrigin: VerticalOrigin.CENTER,
+          scaleByDistance: new NearFarScalar(1e5, 1.5, 1e8, 0.3),
+          id: backingEntity,
+        });
+        const label = collections.labels.add({
+          position,
+          text: satellite.name,
+          font: '9px monospace',
+          fillColor: color.withAlpha(0.8),
+          outlineColor: Color.BLACK,
+          outlineWidth: 2,
+          style: LabelStyle.FILL_AND_OUTLINE,
+          verticalOrigin: VerticalOrigin.BOTTOM,
+          pixelOffset: new Cartesian2(8, -4),
+          scaleByDistance: new NearFarScalar(1e5, 1, 5e7, 0),
+          distanceDisplayCondition: new DistanceDisplayCondition(0, 5_000_000),
+          id: backingEntity,
+        });
+        primitiveMapRef.current.set(satellite.noradId, { billboard, label });
+      }
+
+      const primitiveRefs = primitiveMapRef.current.get(satellite.noradId)!;
+      if (showPaths && orbitPath.length >= 2) {
+        const orbitPositions = orbitPath.map((point) =>
+          Cartesian3.fromDegrees(normalizeLongitude(point.longitude), point.latitude, point.altitude * 1000),
+        );
+        const groundTrackPositions = orbitPath.map((point) =>
+          Cartesian3.fromDegrees(normalizeLongitude(point.longitude), point.latitude, 0),
+        );
+        const nadirPositions = [
+          Cartesian3.fromDegrees(normalizeLongitude(satellite.longitude), satellite.latitude, 0),
+          Cartesian3.fromDegrees(normalizeLongitude(satellite.longitude), satellite.latitude, satellite.altitude * 1000),
+        ];
+
+        if (primitiveRefs.orbit) {
+          primitiveRefs.orbit.positions = orbitPositions;
+          primitiveRefs.orbit.show = true;
+        } else {
+          primitiveRefs.orbit = collections.orbits.add({
+            positions: orbitPositions,
+            width: isIss ? 3 : 2,
+            material: color.withAlpha(isIss ? 0.7 : 0.4),
+          });
         }
-      } catch {
-        // Keep the last known propagated position.
+
+        if (primitiveRefs.groundTrack) {
+          primitiveRefs.groundTrack.positions = groundTrackPositions;
+          primitiveRefs.groundTrack.show = true;
+        } else {
+          primitiveRefs.groundTrack = collections.groundTracks.add({
+            positions: groundTrackPositions,
+            width: isIss ? 2 : 1,
+            material: color.withAlpha(isIss ? 0.35 : 0.15),
+          });
+        }
+
+        if (primitiveRefs.nadir) {
+          primitiveRefs.nadir.positions = nadirPositions;
+          primitiveRefs.nadir.show = true;
+        } else {
+          primitiveRefs.nadir = collections.nadirs.add({
+            positions: nadirPositions,
+            width: 1,
+            material: color.withAlpha(0.2),
+          });
+        }
+      } else {
+        if (primitiveRefs.orbit) primitiveRefs.orbit.show = false;
+        if (primitiveRefs.groundTrack) primitiveRefs.groundTrack.show = false;
+        if (primitiveRefs.nadir) primitiveRefs.nadir.show = false;
+      }
+    }
+
+    recordLayerPerformance('satellites', {
+      updateMs: performance.now() - startedAt,
+      primitives: Array.from(primitiveMapRef.current.values()).reduce(
+        (count, primitives) => count
+          + 2
+          + (primitives.orbit ? 1 : 0)
+          + (primitives.groundTrack ? 1 : 0)
+          + (primitives.nadir ? 1 : 0),
+        0,
+      ),
+      visibleCount: filtered.length,
+    });
+  }, [categoryFilter, isTracking, satellites, showPaths, viewer, visible]);
+
+  useEffect(() => {
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
+
+    const onPreUpdate = () => {
+      const tracked = viewer.trackedEntity;
+      const trackedNoradId = tracked && typeof tracked.id === 'string' && tracked.id.startsWith('sat-')
+        ? Number.parseInt(tracked.id.slice(4), 10)
+        : null;
+
+      const now = performance.now();
+      const shouldRefreshOcclusion = now - lastOcclusionUpdateRef.current >= 220;
+      if (shouldRefreshOcclusion) {
+        lastOcclusionUpdateRef.current = now;
+      }
+
+      const occluder = new EllipsoidalOccluder(Ellipsoid.WGS84, viewer.camera.positionWC);
+
+      for (const [noradId, primitives] of primitiveMapRef.current) {
+        const position = positionMapRef.current.get(noradId);
+        if (!position) {
+          continue;
+        }
+
+        if (trackedNoradId === noradId) {
+          primitives.billboard.scale = 1.0;
+          primitives.billboard.disableDepthTestDistance = Number.POSITIVE_INFINITY;
+          primitives.billboard.alignedAxis = Cartesian3.ZERO;
+          primitives.billboard.rotation = viewer.camera.heading - CesiumMath.toRadians(headingMapRef.current.get(noradId) ?? 0);
+          primitives.billboard.show = true;
+          primitives.label.show = false;
+          continue;
+        }
+
+        if (shouldRefreshOcclusion) {
+          const visibleToCamera = occluder.isPointVisible(position);
+          primitives.billboard.show = visibleToCamera;
+          primitives.label.show = visibleToCamera && !isTracking;
+        }
+
+        primitives.billboard.scale = scaleMapRef.current.get(noradId) ?? 0.35;
+        primitives.billboard.disableDepthTestDistance = 0;
+        primitives.billboard.alignedAxis = Cartesian3.UNIT_Z;
       }
     };
 
-    updatePosition();
-    const intervalId = setInterval(updatePosition, 200);
-    return () => clearInterval(intervalId);
-  }, [dynamicState, sat.altitude, sat.latitude, sat.longitude, sat.satrec, viewer]);
+    viewer.scene.preUpdate.addEventListener(onPreUpdate);
+    return () => {
+      if (!viewer.isDestroyed()) {
+        viewer.scene.preUpdate.removeEventListener(onPreUpdate);
+      }
+    };
+  }, [isTracking, viewer]);
 
-  const positionProperty = useMemo(
-    () => new CallbackProperty(() => dynamicState.position, false),
-    [dynamicState],
-  );
+  useEffect(() => {
+    const collections = collectionsRef.current;
+    if (!collections) {
+      return;
+    }
 
-  const rotationProperty = useMemo(
-    () => new CallbackProperty(() => -CesiumMath.toRadians(dynamicState.heading), false),
-    [dynamicState],
-  );
+    collections.billboards.show = visible;
+    collections.labels.show = visible;
+    collections.orbits.show = visible && showPaths;
+    collections.groundTracks.show = visible && showPaths;
+    collections.nadirs.show = visible && showPaths;
+  }, [showPaths, visible]);
 
-  return (
-    <>
-      <Entity
-        id={`sat-${sat.noradId}`}
-        show={!isFarSide}
-        position={positionProperty as unknown as never}
-        name={sat.name}
-        description={`
-          <p><b>NORAD ID:</b> ${sat.noradId}</p>
-          <p><b>Altitude:</b> ${sat.altitude.toFixed(1)} km</p>
-          <p><b>Lat:</b> ${sat.latitude.toFixed(4)} deg</p>
-          <p><b>Lon:</b> ${sat.longitude.toFixed(4)} deg</p>
-        `}
-      >
-        <BillboardGraphics
-          image={getSatelliteIcon()}
-          color={color}
-          scale={isTracked ? 1.0 : scale}
-          rotation={rotationProperty as unknown as never}
-          alignedAxis={Cartesian3.UNIT_Z}
-          horizontalOrigin={HorizontalOrigin.CENTER}
-          verticalOrigin={VerticalOrigin.CENTER}
-          scaleByDistance={new NearFarScalar(1e5, 1.5, 1e8, 0.3)}
-        />
-        <LabelGraphics
-          show={!hideLabel}
-          text={sat.name}
-          font="9px monospace"
-          fillColor={color.withAlpha(0.8)}
-          outlineColor={Color.BLACK}
-          outlineWidth={2}
-          style={LabelStyle.FILL_AND_OUTLINE}
-          verticalOrigin={VerticalOrigin.BOTTOM}
-          pixelOffset={new Cartesian2(8, -4)}
-          scaleByDistance={new NearFarScalar(1e5, 1, 5e7, 0)}
-        />
-      </Entity>
-
-      {showPaths && orbitPositions && (
-        <Entity id={`sat-${sat.noradId}-orbit`} name={`${sat.name} orbit`}>
-          <PolylineGraphics
-            positions={orbitPositions}
-            width={isIss ? 3 : 2}
-            material={new ColorMaterialProperty(color.withAlpha(isIss ? 0.7 : 0.4))}
-            arcType={ArcType.NONE}
-            clampToGround={false}
-          />
-        </Entity>
-      )}
-
-      {showPaths && groundTrackPositions && (
-        <Entity id={`sat-${sat.noradId}-gtrack`} name={`${sat.name} ground track`}>
-          <PolylineGraphics
-            positions={groundTrackPositions}
-            width={isIss ? 2 : 1}
-            material={new PolylineDashMaterialProperty({
-              color: color.withAlpha(isIss ? 0.35 : 0.15),
-              dashLength: 8,
-            })}
-            arcType={ArcType.GEODESIC}
-            clampToGround={true}
-          />
-        </Entity>
-      )}
-
-      {showPaths && (
-        <Entity id={`sat-${sat.noradId}-nadir`} name={`${sat.name} nadir`}>
-          <PolylineGraphics
-            positions={[
-              Cartesian3.fromDegrees(sat.longitude, sat.latitude, 0),
-              Cartesian3.fromDegrees(sat.longitude, sat.latitude, sat.altitude * 1000),
-            ]}
-            width={1}
-            material={new ColorMaterialProperty(color.withAlpha(0.2))}
-            arcType={ArcType.NONE}
-          />
-        </Entity>
-      )}
-    </>
-  );
-});
+  return null;
+}

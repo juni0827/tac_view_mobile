@@ -4,18 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "dev:server": "node --env-file=server/.env server/index.js",
-    "dev:all": "concurrently \"npm:dev:server\" \"npm:dev\"",
     "build": "tsc -b && vite build",
     "build:sidecar": "node scripts/build_sidecar.mjs",
     "lint": "eslint .",
-    "preview": "vite preview",
     "test:unit": "vitest run tests/unit",
     "test:contracts": "vitest run tests/contracts",
     "test:e2e:desktop": "node tests/e2e/run-desktop-smoke.mjs",
-    "test:smoke:desktop": "powershell -ExecutionPolicy Bypass -File scripts/tac_view_dev_smoke.ps1",
-    "tauri:dev": "tauri dev",
+    "test:smoke:desktop": "node tests/e2e/run-desktop-smoke.mjs",
     "tauri:build:win": "powershell -ExecutionPolicy Bypass -File scripts/tac_view_build_win.ps1"
   },
   "dependencies": {
@@ -42,7 +37,6 @@
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.1",
-    "concurrently": "^9.2.1",
     "esbuild": "^0.25.11",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",

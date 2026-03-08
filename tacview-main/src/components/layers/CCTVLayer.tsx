@@ -2,16 +2,19 @@ import { useEffect, useRef } from 'react';
 import { useCesium } from 'resium';
 import {
   BillboardCollection,
-  LabelCollection,
-  Cartesian3,
   Cartesian2,
+  Cartesian3,
   Color,
-  VerticalOrigin,
-  HorizontalOrigin,
-  NearFarScalar,
   DistanceDisplayCondition,
+  HorizontalOrigin,
+  Label,
+  LabelCollection,
+  NearFarScalar,
+  VerticalOrigin,
+  type Billboard,
 } from 'cesium';
 import type { CameraFeed } from '../../types/camera';
+import { recordLayerPerformance } from '../../lib/performanceStore';
 
 interface CCTVLayerProps {
   cameras: CameraFeed[];
@@ -20,51 +23,47 @@ interface CCTVLayerProps {
 }
 
 const COUNTRY_COLORS: Record<string, Color> = {
-  GB: Color.fromCssColorString('#00D4FF'),   // cyan
-  US: Color.fromCssColorString('#FF9500'),   // amber
-  AU: Color.fromCssColorString('#39FF14'),   // green
+  GB: Color.fromCssColorString('#00D4FF'),
+  US: Color.fromCssColorString('#FF9500'),
+  AU: Color.fromCssColorString('#39FF14'),
 };
 
 const DEFAULT_COLOR = Color.fromCssColorString('#CCCCCC');
 const SELECTED_COLOR = Color.fromCssColorString('#FF3B30');
 
-/**
- * Create a canvas-based camera icon for Cesium billboards.
- */
 function createCameraIcon(color: string, size = 16): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
-  const ctx = canvas.getContext('2d')!;
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return canvas;
+  }
 
-  // Camera body
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.roundRect(2, 4, 10, 8, 1);
-  ctx.fill();
+  context.fillStyle = color;
+  context.beginPath();
+  context.roundRect(2, 4, 10, 8, 1);
+  context.fill();
 
-  // Camera lens
-  ctx.beginPath();
-  ctx.moveTo(12, 5);
-  ctx.lineTo(15, 3);
-  ctx.lineTo(15, 13);
-  ctx.lineTo(12, 11);
-  ctx.closePath();
-  ctx.fill();
+  context.beginPath();
+  context.moveTo(12, 5);
+  context.lineTo(15, 3);
+  context.lineTo(15, 13);
+  context.lineTo(12, 11);
+  context.closePath();
+  context.fill();
 
-  // Recording dot
-  ctx.fillStyle = '#FF3B30';
-  ctx.beginPath();
-  ctx.arc(5, 7, 1.5, 0, Math.PI * 2);
-  ctx.fill();
+  context.fillStyle = '#FF3B30';
+  context.beginPath();
+  context.arc(5, 7, 1.5, 0, Math.PI * 2);
+  context.fill();
 
   return canvas;
 }
 
-// Pre-render icon canvases per country
 const iconCache = new Map<string, HTMLCanvasElement>();
 
-function getCameraIcon(country: string, isSelected: boolean): HTMLCanvasElement {
+function getCameraIcon(country: string, isSelected: boolean) {
   const key = isSelected ? `${country}-selected` : country;
   if (!iconCache.has(key)) {
     const color = isSelected
@@ -79,72 +78,105 @@ export default function CCTVLayer({ cameras, visible, selectedCameraId }: CCTVLa
   const { scene } = useCesium();
   const billboardCollectionRef = useRef<BillboardCollection | null>(null);
   const labelCollectionRef = useRef<LabelCollection | null>(null);
+  const primitiveMapRef = useRef<Map<string, { billboard: Billboard; label: Label }>>(new Map());
 
-  // Create/destroy primitive collections
   useEffect(() => {
-    if (!scene) return;
+    if (!scene) {
+      return;
+    }
 
-    const bbCollection = new BillboardCollection({ scene });
-    const lblCollection = new LabelCollection({ scene });
+    const billboards = new BillboardCollection({ scene });
+    const labels = new LabelCollection({ scene });
 
-    scene.primitives.add(bbCollection);
-    scene.primitives.add(lblCollection);
+    scene.primitives.add(billboards);
+    scene.primitives.add(labels);
 
-    billboardCollectionRef.current = bbCollection;
-    labelCollectionRef.current = lblCollection;
+    billboardCollectionRef.current = billboards;
+    labelCollectionRef.current = labels;
 
     return () => {
       if (!scene.isDestroyed()) {
-        scene.primitives.remove(bbCollection);
-        scene.primitives.remove(lblCollection);
+        scene.primitives.remove(billboards);
+        scene.primitives.remove(labels);
       }
       billboardCollectionRef.current = null;
       labelCollectionRef.current = null;
+      primitiveMapRef.current.clear();
     };
   }, [scene]);
 
-  // Update billboards when cameras or visibility changes
   useEffect(() => {
-    const bbCollection = billboardCollectionRef.current;
-    const lblCollection = labelCollectionRef.current;
-    if (!bbCollection || !lblCollection) return;
+    const billboards = billboardCollectionRef.current;
+    const labels = labelCollectionRef.current;
+    if (!billboards || !labels) {
+      return;
+    }
 
-    // Clear existing
-    bbCollection.removeAll();
-    lblCollection.removeAll();
+    const startedAt = performance.now();
 
-    if (!visible || cameras.length === 0) return;
+    if (!visible) {
+      billboards.show = false;
+      labels.show = false;
+      recordLayerPerformance('cctv', {
+        updateMs: performance.now() - startedAt,
+        primitives: primitiveMapRef.current.size * 2,
+        visibleCount: 0,
+      });
+      return;
+    }
 
-    for (let i = 0; i < cameras.length; i++) {
-      const cam = cameras[i];
-      const isSelected = cam.id === selectedCameraId;
-      const position = Cartesian3.fromDegrees(cam.longitude, cam.latitude, 50);
-      const countryColor = COUNTRY_COLORS[cam.country] || DEFAULT_COLOR;
+    billboards.show = true;
+    labels.show = true;
 
-      bbCollection.add({
+    const activeIds = new Set(cameras.map((camera) => camera.id));
+    for (const [cameraId, primitives] of primitiveMapRef.current) {
+      if (!activeIds.has(cameraId)) {
+        billboards.remove(primitives.billboard);
+        labels.remove(primitives.label);
+        primitiveMapRef.current.delete(cameraId);
+      }
+    }
+
+    for (const camera of cameras) {
+      const isSelected = camera.id === selectedCameraId;
+      const position = Cartesian3.fromDegrees(camera.longitude, camera.latitude, 50);
+      const baseColor = COUNTRY_COLORS[camera.country] || DEFAULT_COLOR;
+      const color = isSelected ? SELECTED_COLOR : baseColor;
+      const existing = primitiveMapRef.current.get(camera.id);
+
+      if (existing) {
+        existing.billboard.position = position;
+        existing.billboard.image = getCameraIcon(camera.country, isSelected) as unknown as string;
+        existing.billboard.color = color;
+        existing.billboard.scale = isSelected ? 1.5 : 1.0;
+        existing.billboard.disableDepthTestDistance = isSelected ? Number.POSITIVE_INFINITY : 0;
+        existing.label.position = position;
+        existing.label.text = camera.name;
+        continue;
+      }
+
+      const billboard = billboards.add({
         position,
-        image: getCameraIcon(cam.country, isSelected),
+        image: getCameraIcon(camera.country, isSelected) as unknown as string,
         scale: isSelected ? 1.5 : 1.0,
-        color: isSelected ? SELECTED_COLOR : countryColor,
+        color,
         verticalOrigin: VerticalOrigin.CENTER,
         horizontalOrigin: HorizontalOrigin.CENTER,
         scaleByDistance: new NearFarScalar(5_000, 1.2, 500_000, 0.4),
         translucencyByDistance: new NearFarScalar(1_000, 1.0, 2_000_000, 0.3),
         distanceDisplayCondition: new DistanceDisplayCondition(0, 2_000_000),
-        // Selected camera always renders on top of 3D tiles / terrain
         disableDepthTestDistance: isSelected ? Number.POSITIVE_INFINITY : 0,
-        id: cam, // Store the full CameraFeed object for EntityClickHandler pick detection
+        id: camera,
       });
 
-      // Label only at close zoom
-      lblCollection.add({
+      const label = labels.add({
         position,
-        text: cam.name,
+        text: camera.name,
         font: '10px JetBrains Mono, monospace',
         fillColor: Color.WHITE.withAlpha(0.9),
         outlineColor: Color.BLACK,
         outlineWidth: 2,
-        style: 2, // FILL_AND_OUTLINE
+        style: 2,
         verticalOrigin: VerticalOrigin.TOP,
         horizontalOrigin: HorizontalOrigin.CENTER,
         pixelOffset: new Cartesian2(0, 12),
@@ -152,8 +184,24 @@ export default function CCTVLayer({ cameras, visible, selectedCameraId }: CCTVLa
         distanceDisplayCondition: new DistanceDisplayCondition(0, 50_000),
       });
 
+      primitiveMapRef.current.set(camera.id, { billboard, label });
     }
-  }, [cameras, visible, selectedCameraId]);
 
-  return null; // Imperative rendering — no JSX needed
+    recordLayerPerformance('cctv', {
+      updateMs: performance.now() - startedAt,
+      primitives: primitiveMapRef.current.size * 2,
+      visibleCount: cameras.length,
+    });
+  }, [cameras, selectedCameraId, visible]);
+
+  useEffect(() => {
+    if (billboardCollectionRef.current) {
+      billboardCollectionRef.current.show = visible;
+    }
+    if (labelCollectionRef.current) {
+      labelCollectionRef.current.show = visible;
+    }
+  }, [visible]);
+
+  return null;
 }
