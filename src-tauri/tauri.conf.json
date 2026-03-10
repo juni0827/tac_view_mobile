@@ -32,6 +32,9 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
+    "resources": [
+      "binaries/better_sqlite3*.node"
+    ],
     "externalBin": [
       "binaries/tac_view-sidecar"
     ]

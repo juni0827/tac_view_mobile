@@ -140,6 +140,10 @@ export default function EntityClickHandler({ onTrackEntity, onCctvClick }: Entit
           ? new Cartesian3(0, -30_000, 30_000)
           : entityType === 'ship'
             ? new Cartesian3(0, -1_200, 2_100)
+            : entityType === 'facility'
+              ? new Cartesian3(0, -3_500, 5_500)
+              : entityType === 'earthquake'
+                ? new Cartesian3(0, -40_000, 40_000)
             : new Cartesian3(0, -200_000, 200_000);
 
       entity.viewFrom = new ConstantProperty(offset) as unknown as never;
@@ -173,6 +177,7 @@ function classifyEntity(entity: CesiumEntity): TrackedEntityType {
     if (entity.id.startsWith('sat-')) return 'satellite';
     if (entity.id.startsWith('flight-')) return 'aircraft';
     if (entity.id.startsWith('ship-')) return 'ship';
+    if (entity.id.startsWith('eq-')) return 'earthquake';
   }
 
   const name = (entity.name || '').toLowerCase();

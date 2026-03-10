@@ -5,6 +5,18 @@ import type { GeoStatus } from '../../hooks/useGeolocation';
 import MobileModal from './MobileModal';
 import type { AltitudeBand } from '../layers/flightLayerUtils';
 
+interface DesignatableGroup {
+  id: string;
+  label: string;
+  kind: 'MESO' | 'MICRO';
+  confidence: number;
+  memberCount: number;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  distanceKm: number;
+}
+
 interface OperationsPanelProps {
   shaderMode: ShaderMode;
   onShaderChange: (mode: ShaderMode) => void;
@@ -23,12 +35,19 @@ interface OperationsPanelProps {
   onMapTilesChange: (tile: 'google' | 'osm') => void;
   showPaths: boolean;
   onShowPathsToggle: () => void;
+  showPredictions: boolean;
+  onShowPredictionsToggle: () => void;
+  airspaceRangeKm: 80 | 160 | 320 | 640;
+  onAirspaceRangeChange: (range: 80 | 160 | 320 | 640) => void;
   altitudeFilter: Record<AltitudeBand, boolean>;
   onAltitudeToggle: (band: AltitudeBand) => void;
   showSatPaths: boolean;
   onShowSatPathsToggle: () => void;
   satCategoryFilter: Record<SatelliteCategory, boolean>;
   onSatCategoryToggle: (category: SatelliteCategory) => void;
+  designatableGroups: DesignatableGroup[];
+  selectedGroupId: string | null;
+  onGroupDesignate: (group: DesignatableGroup) => void;
   onResetView: () => void;
   onLocateMe: () => void;
   geoStatus: GeoStatus;
@@ -64,6 +83,13 @@ const SATELLITE_CATEGORIES: { category: SatelliteCategory; label: string; colour
   { category: 'other', label: 'OTHER', colour: 'text-[#39FF14]', dotColour: 'bg-[#39FF14]', icon: '🛰' },
 ];
 
+const AIRSPACE_RANGE_OPTIONS: { label: string; range: 80 | 160 | 320 | 640 }[] = [
+  { label: 'TERMINAL 80KM', range: 80 },
+  { label: 'SECTOR 160KM', range: 160 },
+  { label: 'REGIONAL 320KM', range: 320 },
+  { label: 'THEATER 640KM', range: 640 },
+];
+
 export default function OperationsPanel({
   shaderMode,
   onShaderChange,
@@ -74,12 +100,19 @@ export default function OperationsPanel({
   onMapTilesChange,
   showPaths,
   onShowPathsToggle,
+  showPredictions,
+  onShowPredictionsToggle,
+  airspaceRangeKm,
+  onAirspaceRangeChange,
   altitudeFilter,
   onAltitudeToggle,
   showSatPaths,
   onShowSatPathsToggle,
   satCategoryFilter,
   onSatCategoryToggle,
+  designatableGroups,
+  selectedGroupId,
+  onGroupDesignate,
   onResetView,
   onLocateMe,
   geoStatus,
@@ -201,6 +234,42 @@ export default function OperationsPanel({
             <span className="tracking-wider">ROUTE PATHS</span>
             <span className={`ml-auto w-1.5 h-1.5 rounded-full ${showPaths ? 'bg-wv-cyan' : 'bg-wv-muted/30'}`} />
           </button>
+          <button
+            onClick={onShowPredictionsToggle}
+            className={`
+              flex items-center gap-2 px-2 py-1.5 rounded text-[10px] w-full
+              transition-all duration-200 text-left mb-1
+              ${isMobile ? 'min-h-[44px]' : ''}
+              ${showPredictions
+                ? 'text-wv-green bg-wv-green/10'
+                : 'text-wv-muted hover:text-wv-text hover:bg-white/5'
+              }
+            `}
+          >
+            <span className="text-sm">P</span>
+            <span className="tracking-wider">PREDICTIONS</span>
+            <span className={`ml-auto w-1.5 h-1.5 rounded-full ${showPredictions ? 'bg-wv-green' : 'bg-wv-muted/30'}`} />
+          </button>
+          <div className="text-[8px] text-wv-muted tracking-widest uppercase mt-2 mb-1 px-1">Airspace Range</div>
+          <div className="grid grid-cols-2 gap-1">
+            {AIRSPACE_RANGE_OPTIONS.map(({ label, range }) => (
+              <button
+                key={range}
+                onClick={() => onAirspaceRangeChange(range)}
+                className={`
+                  px-2 py-1.5 rounded text-[9px] font-bold tracking-wider text-left
+                  transition-all duration-200
+                  ${isMobile ? 'min-h-[40px]' : ''}
+                  ${airspaceRangeKm === range
+                    ? 'text-wv-amber bg-wv-amber/10 ring-1 ring-wv-amber/30'
+                    : 'text-wv-muted hover:text-wv-text hover:bg-white/5'
+                  }
+                `}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="text-[8px] text-wv-muted tracking-widest uppercase mt-2 mb-1 px-1">Altitude Bands</div>
           <div className="flex flex-col gap-0.5">
             {ALTITUDE_BANDS.map(({ band, label, colour, dotColour }) => (
@@ -268,6 +337,42 @@ export default function OperationsPanel({
           </div>
         </div>
       )}
+
+      <div className="p-3 border-t border-wv-border">
+        <div className="text-[9px] text-wv-muted tracking-widest uppercase mb-2">Group Designation</div>
+        <div className="text-[8px] text-wv-muted tracking-widest uppercase mb-1 px-1">
+          AIRSPACE {airspaceRangeKm}KM
+        </div>
+        <div className="flex flex-col gap-0.5">
+          {designatableGroups.length === 0 ? (
+            <div className="px-2 py-1.5 text-[9px] text-wv-muted/70">
+              NO GROUPS IN CURRENT AIRSPACE
+            </div>
+          ) : (
+            designatableGroups.map((group) => (
+              <button
+                key={group.id}
+                onClick={() => onGroupDesignate(group)}
+                className={`
+                  flex items-center gap-2 px-2 py-1.5 rounded text-[9px] text-left
+                  transition-all duration-200
+                  ${isMobile ? 'min-h-[40px]' : ''}
+                  ${selectedGroupId === group.id
+                    ? 'text-wv-cyan bg-wv-cyan/10 ring-1 ring-wv-cyan/25'
+                    : 'text-wv-muted hover:text-wv-text hover:bg-white/5'
+                  }
+                `}
+              >
+                <span className={`w-2 h-2 rounded-full ${group.kind === 'MESO' ? 'bg-wv-amber' : 'bg-wv-cyan'}`} />
+                <span className="tracking-wider">{group.label}</span>
+                <span className="ml-auto text-[8px] text-wv-muted">
+                  {group.memberCount} / {Math.round(group.distanceKm)}KM
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
 
       {/* Locate Me + Reset View */}
       <div className="p-3 border-t border-wv-border flex flex-col gap-1">

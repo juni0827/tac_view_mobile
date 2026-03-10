@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react';
 import type { TrackedEntityInfo, TrackedEntityType } from '../../types/trackedEntity';
+import type { OntologyEntityDetail } from '../../types/ontology';
 
 interface TrackedEntityPanelProps {
   trackedEntity: TrackedEntityInfo | null;
+  ontologyEntity?: OntologyEntityDetail | null;
   onUnlock?: () => void;
   isMobile?: boolean;
 }
@@ -61,6 +63,17 @@ function flightAwareUrl(registration: string): string {
   return `https://www.flightaware.com/live/flight/${registration.replace(/-/g, '')}`;
 }
 
+function formatTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return 'N/A';
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toISOString().replace('T', ' ').slice(0, 19);
+}
+
 function DetailGrid({
   details,
   trackedEntity,
@@ -101,8 +114,55 @@ function DetailGrid({
   );
 }
 
+function OntologySummary({ ontologyEntity }: { ontologyEntity: OntologyEntityDetail }) {
+  return (
+    <div className="mt-2 rounded border border-wv-amber/20 bg-black/20 px-3 py-2">
+      <div className="mb-2 text-[9px] font-mono uppercase tracking-[0.25em] text-wv-amber">Ontology</div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px] font-mono">
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Type</span>
+          <span className="text-wv-amber text-right">{ontologyEntity.canonicalType.toUpperCase()}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Confidence</span>
+          <span className="text-wv-amber text-right">{Math.round(ontologyEntity.confidence * 100)}%</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Sources</span>
+          <span className="text-wv-amber text-right">{ontologyEntity.sourceCount}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Relations</span>
+          <span className="text-wv-amber text-right">{ontologyEntity.relations.length}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Last Seen</span>
+          <span className="text-wv-amber text-right">{formatTimestamp(ontologyEntity.lastObservedAt)}</span>
+        </div>
+        <div className="flex justify-between gap-2">
+          <span className="text-wv-muted">Operator</span>
+          <span className="text-wv-amber text-right">{ontologyEntity.operator || 'N/A'}</span>
+        </div>
+      </div>
+      {ontologyEntity.aliasList.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {ontologyEntity.aliasList.slice(0, 5).map((alias) => (
+            <span
+              key={alias}
+              className="rounded border border-wv-border px-1.5 py-0.5 text-[9px] font-mono text-wv-text"
+            >
+              {alias}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function TrackedEntityPanel({
   trackedEntity,
+  ontologyEntity = null,
   onUnlock,
   isMobile = false,
 }: TrackedEntityPanelProps) {
@@ -142,7 +202,12 @@ export default function TrackedEntityPanel({
             </div>
           </button>
 
-          {expanded && <div className="px-3 pb-2"><DetailGrid details={details} trackedEntity={trackedEntity} /></div>}
+          {expanded && (
+            <div className="px-3 pb-2">
+              <DetailGrid details={details} trackedEntity={trackedEntity} />
+              {ontologyEntity && <OntologySummary ontologyEntity={ontologyEntity} />}
+            </div>
+          )}
 
           <button
             onClick={onUnlock}
@@ -180,6 +245,7 @@ export default function TrackedEntityPanel({
         </div>
 
         <DetailGrid details={details} trackedEntity={trackedEntity} />
+        {ontologyEntity && <OntologySummary ontologyEntity={ontologyEntity} />}
 
         <button
           onClick={onUnlock}

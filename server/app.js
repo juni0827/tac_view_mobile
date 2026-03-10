@@ -14,9 +14,11 @@ import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import NodeCache from 'node-cache';
 import { createServer } from 'http';
+import path from 'node:path';
 import { SYDNEY_ROADS } from './data/sydneyRoads.js';
 import { applyRuntimeConfigToEnv, loadRuntimeConfigSync } from './runtime-config.js';
 import { createSnapshotStore } from './snapshot-store.js';
+import { createOntologyService } from './ontology/service.js';
 
 const runtimeConfig = loadRuntimeConfigSync();
 applyRuntimeConfigToEnv(runtimeConfig);
@@ -24,9 +26,20 @@ applyRuntimeConfigToEnv(runtimeConfig);
 const app = express();
 const PORT = runtimeConfig.port;
 const snapshotStore = createSnapshotStore(runtimeConfig.snapshotDir);
+const ontologyService = createOntologyService({
+  dbPath: path.join(runtimeConfig.snapshotDir, 'ontology.db'),
+  snapshotStore,
+  connectorConfig: {
+    overpassUrls: runtimeConfig.server.ontologyOverpassUrls,
+    wikidataEntityDataUrl: runtimeConfig.server.wikidataEntityDataUrl,
+    wikidataUserAgent: runtimeConfig.server.wikidataUserAgent,
+    geonamesUsername: runtimeConfig.server.geonamesUsername,
+    geonamesApiUrl: runtimeConfig.server.geonamesApiUrl,
+  },
+});
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 app.use('/api', (req, res, next) => {
   if (!runtimeConfig.authToken) {
@@ -41,6 +54,134 @@ app.use('/api', (req, res, next) => {
   }
 
   res.status(401).json({ error: 'Unauthorized' });
+});
+
+function parseOntologyBbox(query) {
+  const south = Number.parseFloat(query.south);
+  const west = Number.parseFloat(query.west);
+  const north = Number.parseFloat(query.north);
+  const east = Number.parseFloat(query.east);
+  if ([south, west, north, east].some((value) => !Number.isFinite(value))) {
+    return null;
+  }
+  return { south, west, north, east };
+}
+
+app.post('/api/ontology/sync', async (req, res) => {
+  try {
+    const result = await ontologyService.syncFromFrontend(req.body ?? {});
+    res.json(result);
+  } catch (error) {
+    console.error('[ONTOLOGY] Sync error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/search', async (req, res) => {
+  try {
+    const layerIds = String(req.query.layers || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const canonicalTypes = String(req.query.types || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const bbox = parseOntologyBbox(req.query);
+    await ontologyService.ensureInfrastructureForSearch({ bbox, layerIds });
+    const items = ontologyService.searchEntities({
+      q: String(req.query.q || ''),
+      limit: Math.min(Number.parseInt(String(req.query.limit || '50'), 10) || 50, 400),
+      layerIds,
+      canonicalTypes,
+      source: String(req.query.source || ''),
+      country: String(req.query.country || '').toUpperCase(),
+      minConfidence: Number.parseFloat(String(req.query.minConfidence || '0')) || 0,
+      freshnessHours: Number.parseFloat(String(req.query.freshnessHours || '0')) || 0,
+      bbox,
+      includeSynthetic: req.query.includeSynthetic === '1',
+    });
+    res.json({ items });
+  } catch (error) {
+    console.error('[ONTOLOGY] Search error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/entities/:id', (req, res) => {
+  try {
+    const entity = ontologyService.getEntity(req.params.id);
+    if (!entity) {
+      return res.status(404).json({ error: 'Entity not found' });
+    }
+    res.json(entity);
+  } catch (error) {
+    console.error('[ONTOLOGY] Entity detail error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/entities/:id/evidence', (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(String(req.query.page || '1'), 10) || 1);
+    const pageSize = Math.min(100, Number.parseInt(String(req.query.pageSize || '20'), 10) || 20);
+    const items = ontologyService.getEvidence(req.params.id, page, pageSize);
+    res.json({ items, page, pageSize });
+  } catch (error) {
+    console.error('[ONTOLOGY] Evidence error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/layers', (_req, res) => {
+  try {
+    res.json({ items: ontologyService.listLayers() });
+  } catch (error) {
+    console.error('[ONTOLOGY] Layer list error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/connectors', (_req, res) => {
+  try {
+    res.json(ontologyService.listConnectorStatus());
+  } catch (error) {
+    console.error('[ONTOLOGY] Connector status error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/relations', (req, res) => {
+  try {
+    const items = ontologyService.listRelations({
+      entityId: req.query.entityId ? String(req.query.entityId) : null,
+      relationType: String(req.query.relationType || ''),
+      limit: Math.min(Number.parseInt(String(req.query.limit || '100'), 10) || 100, 500),
+    });
+    res.json({ items });
+  } catch (error) {
+    console.error('[ONTOLOGY] Relations error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/ontology/presets', (_req, res) => {
+  try {
+    res.json({ items: ontologyService.listPresets() });
+  } catch (error) {
+    console.error('[ONTOLOGY] Preset list error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/ontology/presets', (req, res) => {
+  try {
+    const preset = ontologyService.savePreset(req.body ?? {});
+    res.status(201).json(preset);
+  } catch (error) {
+    console.error('[ONTOLOGY] Preset save error:', error.message);
+    res.status(400).json({ error: error.message });
+  }
 });
 
 // ??? Cache ????????????????????????????????????????????????????
@@ -801,6 +942,11 @@ app.get('/api/health', (_req, res) => {
       configPath: runtimeConfig.configPath,
       snapshotDir: runtimeConfig.snapshotDir,
       authTokenEnabled: Boolean(runtimeConfig.authToken),
+      ontology: {
+        overpassUrlCount: runtimeConfig.server.ontologyOverpassUrls.length,
+        wikidataEnabled: Boolean(runtimeConfig.server.wikidataEntityDataUrl),
+        geonamesEnabled: Boolean(runtimeConfig.server.geonamesUsername),
+      },
     },
   });
 });
@@ -1170,6 +1316,11 @@ export function stopBackgroundTasks() {
   if (routeRegistryTimeout) {
     clearTimeout(routeRegistryTimeout);
     routeRegistryTimeout = null;
+  }
+  try {
+    ontologyService.db.close();
+  } catch {
+    // Best-effort shutdown for tests and standalone runs.
   }
 }
 

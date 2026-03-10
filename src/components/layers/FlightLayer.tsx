@@ -7,12 +7,10 @@ import {
   CallbackProperty,
   Cartesian2 as CesiumCartesian2,
   Cartesian3,
-  Cartographic,
   Color,
   ConstantProperty,
   DistanceDisplayCondition,
   Ellipsoid,
-  EllipsoidGeodesic,
   Entity as CesiumEntity,
   HorizontalOrigin,
   Label,
@@ -29,6 +27,7 @@ import * as Cesium from 'cesium';
 import type { Flight } from '../../hooks/useFlights';
 import { getAirportCoords } from '../../data/airports';
 import { recordLayerPerformance } from '../../lib/performanceStore';
+import { appendFlightTrackSample, buildFlightPathGeometry } from '../../lib/flightPathPredictor';
 import {
   isRenderableAltitude,
   isRenderableLatitude,
@@ -46,9 +45,11 @@ const EllipsoidalOccluder = (Cesium as unknown as {
 }).EllipsoidalOccluder;
 
 export interface FlightLayerProps {
+  airspaceRangeKm: number;
   flights: Flight[];
   visible: boolean;
   showPaths: boolean;
+  showPredictions: boolean;
   altitudeFilter: Record<AltitudeBand, boolean>;
   isTracking: boolean;
 }
@@ -146,53 +147,11 @@ function buildFlightDescription(flight: Flight) {
   `;
 }
 
-const ROUTE_ALTITUDE = 11_000;
-const ROUTE_SEGMENTS = 12;
 const ROUTE_COMPLETED_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.18);
 const ROUTE_REMAINING_COLOR = Color.fromCssColorString('#00D4FF').withAlpha(0.35);
 const LABEL_OFFSET = new CesiumCartesian2(10, -4);
 const TRAIL_ALPHA = 0.4;
 const TRACKED_SCALE = 1.0;
-
-function buildRoutePositions(
-  fromLat: number,
-  fromLon: number,
-  toLat: number,
-  toLon: number,
-  altitudeStart: number,
-  altitudeEnd: number,
-  curveUp: boolean,
-) {
-  if (
-    !isRenderableLatitude(fromLat) ||
-    !isRenderableLongitude(fromLon) ||
-    !isRenderableLatitude(toLat) ||
-    !isRenderableLongitude(toLon)
-  ) {
-    return [] as Cartesian3[];
-  }
-
-  const start = Cartographic.fromDegrees(fromLon, fromLat);
-  const end = Cartographic.fromDegrees(toLon, toLat);
-  const geodesic = new EllipsoidGeodesic(start, end, Ellipsoid.WGS84);
-  const positions: Cartesian3[] = [];
-
-  for (let index = 0; index <= ROUTE_SEGMENTS; index += 1) {
-    const fraction = index / ROUTE_SEGMENTS;
-    const cartographic = geodesic.interpolateUsingFraction(fraction);
-    const arcAltitude = curveUp
-      ? ROUTE_ALTITUDE * Math.sin(fraction * Math.PI * 0.5) + 500
-      : ROUTE_ALTITUDE * Math.cos(fraction * Math.PI * 0.5) + 500;
-    cartographic.height = index === 0
-      ? altitudeStart
-      : index === ROUTE_SEGMENTS
-        ? altitudeEnd
-        : arcAltitude;
-    positions.push(Ellipsoid.WGS84.cartographicToCartesian(cartographic));
-  }
-
-  return positions;
-}
 
 function buildTrailPositions(flight: Flight, position: Cartesian3) {
   if (flight.heading == null || flight.velocityKnots == null || flight.velocityKnots < 50) {
@@ -215,9 +174,11 @@ function buildTrailPositions(flight: Flight, position: Cartesian3) {
 }
 
 export default function FlightLayer({
+  airspaceRangeKm,
   flights,
   visible,
   showPaths,
+  showPredictions,
   altitudeFilter,
   isTracking,
 }: FlightLayerProps) {
@@ -234,6 +195,7 @@ export default function FlightLayer({
   const primitiveMapRef = useRef<Map<string, FlightPrimitiveRefs>>(new Map());
   const trailMapRef = useRef<Map<string, Polyline>>(new Map());
   const routeMapRef = useRef<Map<string, RoutePrimitiveRefs>>(new Map());
+  const historyMapRef = useRef<Map<string, ReturnType<typeof appendFlightTrackSample>>>(new Map());
   const lastOcclusionUpdateRef = useRef(0);
 
   useEffect(() => {
@@ -275,6 +237,7 @@ export default function FlightLayer({
       entityMapRef.current.clear();
       positionMapRef.current.clear();
       flightStateRef.current.clear();
+      historyMapRef.current.clear();
     };
   }, [viewer]);
 
@@ -302,9 +265,12 @@ export default function FlightLayer({
       return;
     }
 
-    const activeIcaos = new Set<string>();
+    const presentIcaos = new Set<string>();
+    const renderableFlights: Flight[] = [];
 
     for (const flight of flights) {
+      presentIcaos.add(flight.icao24);
+
       if (
         !isRenderableLatitude(flight.latitude) ||
         !isRenderableLongitude(flight.longitude) ||
@@ -318,6 +284,13 @@ export default function FlightLayer({
         continue;
       }
 
+      renderableFlights.push(flight);
+    }
+
+    const activeIcaos = new Set<string>();
+    const now = Date.now();
+
+    for (const flight of renderableFlights) {
       activeIcaos.add(flight.icao24);
 
       const position = Cartesian3.fromDegrees(normalizeLongitude(flight.longitude), flight.latitude, flight.altitude);
@@ -328,8 +301,12 @@ export default function FlightLayer({
         alt: flight.altitude,
         heading: flight.heading ?? null,
         speed: flight.velocityKnots ?? null,
-        updatedAt: Date.now(),
+        updatedAt: now,
       });
+      historyMapRef.current.set(
+        flight.icao24,
+        appendFlightTrackSample(historyMapRef.current.get(flight.icao24) ?? [], flight, now),
+      );
 
       const color = getAltitudeColor(flight.altitudeFeet);
       const scale = getAltitudeScale(flight.altitudeFeet);
@@ -435,54 +412,48 @@ export default function FlightLayer({
         const origin = getAirportCoords(flight.originAirport);
         const destination = getAirportCoords(flight.destAirport);
 
-        if (origin) {
-          const completedPositions = buildRoutePositions(
-            origin.lat,
-            origin.lon,
-            flight.latitude,
-            flight.longitude,
-            500,
-            flight.altitude,
-            true,
-          );
-          if (completedPositions.length >= 2) {
-            if (existingRoutes.completed) {
-              existingRoutes.completed.positions = completedPositions;
-              existingRoutes.completed.show = true;
-            } else {
-              existingRoutes.completed = collections.routes.add({
-                positions: completedPositions,
-                width: 1,
-                material: Material.fromType('Color', { color: ROUTE_COMPLETED_COLOR }),
-              });
-            }
+        const geometry = buildFlightPathGeometry(flight, {
+          airspaceRangeKm,
+          destination,
+          history: historyMapRef.current.get(flight.icao24) ?? [],
+          nearbyFlights: renderableFlights,
+          origin,
+        });
+        const completedPositions = geometry.completed.map((point) =>
+          Cartesian3.fromDegrees(point.longitude, point.latitude, point.altitude),
+        );
+        const remainingPositions = showPredictions
+          ? geometry.remaining.map((point) =>
+            Cartesian3.fromDegrees(point.longitude, point.latitude, point.altitude),
+          )
+          : [];
+
+        if (completedPositions.length >= 2) {
+          if (existingRoutes.completed) {
+            existingRoutes.completed.positions = completedPositions;
+            existingRoutes.completed.show = true;
+          } else {
+            existingRoutes.completed = collections.routes.add({
+              positions: completedPositions,
+              width: 1,
+              material: Material.fromType('Color', { color: ROUTE_COMPLETED_COLOR }),
+            });
           }
         } else if (existingRoutes.completed) {
           collections.routes.remove(existingRoutes.completed);
           delete existingRoutes.completed;
         }
 
-        if (destination) {
-          const remainingPositions = buildRoutePositions(
-            flight.latitude,
-            flight.longitude,
-            destination.lat,
-            destination.lon,
-            flight.altitude,
-            500,
-            false,
-          );
-          if (remainingPositions.length >= 2) {
-            if (existingRoutes.remaining) {
-              existingRoutes.remaining.positions = remainingPositions;
-              existingRoutes.remaining.show = true;
-            } else {
-              existingRoutes.remaining = collections.routes.add({
-                positions: remainingPositions,
-                width: 1.5,
-                material: Material.fromType('Color', { color: ROUTE_REMAINING_COLOR }),
-              });
-            }
+        if (remainingPositions.length >= 2) {
+          if (existingRoutes.remaining) {
+            existingRoutes.remaining.positions = remainingPositions;
+            existingRoutes.remaining.show = true;
+          } else {
+            existingRoutes.remaining = collections.routes.add({
+              positions: remainingPositions,
+              width: 1.5,
+              material: Material.fromType('Color', { color: ROUTE_REMAINING_COLOR }),
+            });
           }
         } else if (existingRoutes.remaining) {
           collections.routes.remove(existingRoutes.remaining);
@@ -533,6 +504,12 @@ export default function FlightLayer({
       }
     });
 
+    for (const icao of Array.from(historyMapRef.current.keys())) {
+      if (!presentIcaos.has(icao)) {
+        historyMapRef.current.delete(icao);
+      }
+    }
+
     recordLayerPerformance('flights', {
       updateMs: performance.now() - startedAt,
       primitives: primitiveMapRef.current.size * 2
@@ -543,7 +520,7 @@ export default function FlightLayer({
         ),
       visibleCount: activeIcaos.size,
     });
-  }, [altitudeFilter, flights, showPaths, viewer, visible]);
+  }, [airspaceRangeKm, altitudeFilter, flights, showPaths, showPredictions, viewer, visible]);
 
   useEffect(() => {
     const collections = collectionsRef.current;

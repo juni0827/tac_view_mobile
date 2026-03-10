@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdir, rm } from 'node:fs/promises';
+import { copyFile, mkdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -94,6 +94,18 @@ async function main() {
     binariesDir,
     `tac_view-sidecar-${targetTriple}${pkgTarget.extension}`,
   );
+  const nativeBindingSourcePath = path.join(
+    rootDir,
+    'node_modules',
+    'better-sqlite3',
+    'build',
+    'Release',
+    'better_sqlite3.node',
+  );
+  const nativeBindingOutputPath = path.join(
+    binariesDir,
+    `better_sqlite3-${targetTriple}.node`,
+  );
   const relativeBundlePath = path.relative(rootDir, bundlePath);
   const relativeOutputPath = path.relative(rootDir, outputPath);
 
@@ -109,8 +121,10 @@ async function main() {
     'GZip',
   ].join(' ');
   run(pkgCommand);
+  await copyFile(nativeBindingSourcePath, nativeBindingOutputPath);
 
   console.log(`[sidecar] built ${outputPath}`);
+  console.log(`[sidecar] copied native binding ${nativeBindingOutputPath}`);
 }
 
 main().catch((error) => {
