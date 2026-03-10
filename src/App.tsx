@@ -1,5 +1,5 @@
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { Viewer as CesiumViewer, Cartesian3, ConstantProperty, Math as CesiumMath, Entity as CesiumEntity } from 'cesium';
+import { Viewer as CesiumViewer, Cartesian3, Color, ConstantProperty, Math as CesiumMath, Entity as CesiumEntity } from 'cesium';
 import type { CameraFeed } from './types/camera';
 import GlobeViewer from './components/globe/GlobeViewer';
 import EarthquakeLayer from './components/layers/EarthquakeLayer';
@@ -8,6 +8,7 @@ import FlightLayer from './components/layers/FlightLayer';
 import TrafficLayer from './components/layers/TrafficLayer';
 import CCTVLayer from './components/layers/CCTVLayer';
 import ShipLayer from './components/layers/ShipLayer';
+import OntologyLayer from './components/layers/OntologyLayer';
 import type { SatelliteCategory } from './components/layers/SatelliteLayer';
 import type { AltitudeBand } from './components/layers/flightLayerUtils';
 import OperationsPanel from './components/ui/OperationsPanel';
@@ -17,9 +18,9 @@ import AudioToggle from './components/ui/AudioToggle';
 import CCTVPanel from './components/ui/CCTVPanel';
 import Crosshair from './components/ui/Crosshair';
 import TrackedEntityPanel from './components/ui/TrackedEntityPanel';
-import SplashScreen from './components/ui/SplashScreen';
 import FilmGrain from './components/ui/FilmGrain';
 import VisualIntelligenceLayer from './components/layers/VisualIntelligenceLayer';
+import OntologyWorkbench from './components/ui/OntologyWorkbench';
 import { useEarthquakes, type Earthquake } from './hooks/useEarthquakes';
 import { useSatellites, type SatellitePosition } from './hooks/useSatellites';
 import { useFlights, type Flight } from './hooks/useFlights';
@@ -32,10 +33,15 @@ import { useIsMobile } from './hooks/useIsMobile';
 import { useAudio } from './hooks/useAudio';
 import { useVisualIntelligence } from './hooks/useVisualIntelligence';
 import { groupController } from './intelligence/groupController';
+import type {
+  SelectionContext,
+  TieredGroupSnapshot,
+} from './intelligence/visualIntelligence';
 import type { ShaderMode } from './shaders/postprocess';
 import type { IntelFeedItem } from './components/ui/IntelFeed';
 import type { TrackedEntityInfo } from './types/trackedEntity';
 import type { RenderCameraState } from './types/rendering';
+import type { OntologyEntity } from './types/ontology';
 import {
   isRenderableAltitude,
   isRenderableLatitude,
@@ -46,6 +52,14 @@ import {
 } from './lib/cesiumSafety';
 import { buildRenderBudget, shouldRefreshCameraQuery } from './lib/renderBudget';
 import { GridSpatialIndex, deriveRenderPriorityIds, selectPriorityItems } from './lib/renderQuery';
+import { useOntologySync } from './ontology/useOntologySync';
+import { useOntologyWorkbench } from './ontology/useOntologyWorkbench';
+import {
+  buildOntologyTrackedEntityInfo,
+  getOntologyEntityFocus,
+  isOntologyMapRenderable,
+  mergeOntologySelectionContext,
+} from './ontology/presentation';
 
 interface CameraState {
   latitude: number;
@@ -61,6 +75,22 @@ interface RenderEntry<T> {
   longitude: number;
   item: T;
 }
+
+type AirspaceRangeKm = 80 | 160 | 320 | 640;
+
+interface DesignatableGroup {
+  id: string;
+  label: string;
+  kind: 'MESO' | 'MICRO';
+  confidence: number;
+  memberCount: number;
+  latitude: number;
+  longitude: number;
+  altitude: number;
+  distanceKm: number;
+}
+
+const DEFAULT_AIRSPACE_RANGE_KM: AirspaceRangeKm = 160;
 
 const DEFAULT_ALTITUDE_FILTER: Record<AltitudeBand, boolean> = {
   cruise: false,
@@ -88,6 +118,130 @@ function toRenderCameraState(camera: CameraState, timestamp = Date.now()): Rende
     ...camera,
     timestamp,
   };
+}
+
+function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const earthRadiusKm = 6371;
+  const lat1Rad = (lat1 * Math.PI) / 180;
+  const lat2Rad = (lat2 * Math.PI) / 180;
+  const deltaLat = ((lat2 - lat1) * Math.PI) / 180;
+  const deltaLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a = Math.sin(deltaLat / 2) ** 2 +
+    Math.cos(lat1Rad) * Math.cos(lat2Rad) * Math.sin(deltaLon / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusKm * c;
+}
+
+function filterTieredGroupsByRange(
+  tieredGroups: TieredGroupSnapshot,
+  cameraState: RenderCameraState,
+  airspaceRangeKm: number,
+  pinnedGroupId: string | null,
+): TieredGroupSnapshot {
+  const inRange = (latitude: number, longitude: number) =>
+    haversineKm(cameraState.latitude, cameraState.longitude, latitude, longitude) <= airspaceRangeKm;
+
+  return {
+    ...tieredGroups,
+    microGroups: tieredGroups.microGroups.filter((group) =>
+      group.id === pinnedGroupId || inRange(group.centroid.latitude, group.centroid.longitude),
+    ),
+    mesoGroups: tieredGroups.mesoGroups.filter((group) =>
+      group.id === pinnedGroupId || inRange(group.centroid.latitude, group.centroid.longitude),
+    ),
+    activityClouds: tieredGroups.activityClouds
+      .map((cloud) => ({
+        ...cloud,
+        cells: cloud.cells.filter((cell) =>
+          cloud.id === pinnedGroupId || inRange(cell.latitude, cell.longitude),
+        ),
+      }))
+      .filter((cloud) => cloud.id === pinnedGroupId || cloud.cells.length > 0),
+  };
+}
+
+function buildDesignatableGroups(
+  groups: TieredGroupSnapshot,
+  cameraState: RenderCameraState,
+): DesignatableGroup[] {
+  const micro = groups.microGroups.map((group): DesignatableGroup => ({
+    id: group.id,
+    label: group.label,
+    kind: 'MICRO',
+    confidence: group.confidence,
+    memberCount: group.memberIds.length,
+    latitude: group.centroid.latitude,
+    longitude: group.centroid.longitude,
+    altitude: group.centroid.altitude,
+    distanceKm: haversineKm(cameraState.latitude, cameraState.longitude, group.centroid.latitude, group.centroid.longitude),
+  }));
+  const meso = groups.mesoGroups.map((group): DesignatableGroup => ({
+    id: group.id,
+    label: group.label,
+    kind: 'MESO',
+    confidence: group.confidence,
+    memberCount: group.microGroupIds.length,
+    latitude: group.centroid.latitude,
+    longitude: group.centroid.longitude,
+    altitude: group.centroid.altitude,
+    distanceKm: haversineKm(cameraState.latitude, cameraState.longitude, group.centroid.latitude, group.centroid.longitude),
+  }));
+
+  return [...meso, ...micro]
+    .sort((left, right) =>
+      right.confidence - left.confidence || left.distanceKm - right.distanceKm,
+    )
+    .slice(0, 6);
+}
+
+function stripSelectionPredictions(
+  selectionContext: SelectionContext | null,
+  enabled: boolean,
+) {
+  if (!selectionContext || enabled) {
+    return selectionContext;
+  }
+
+  return {
+    ...selectionContext,
+    predictedPaths: [],
+    destinationCandidates: [],
+  };
+}
+
+function findViewerEntity(viewer: CesiumViewer, entityId: string) {
+  const rootEntity = viewer.entities.getById(entityId);
+  if (rootEntity) {
+    return rootEntity;
+  }
+
+  for (let index = 0; index < viewer.dataSources.length; index += 1) {
+    const entity = viewer.dataSources.get(index)?.entities.getById(entityId);
+    if (entity) {
+      return entity;
+    }
+  }
+
+  return null;
+}
+
+function getTrackedViewOffset(entityType: TrackedEntityInfo['entityType']) {
+  if (entityType === 'satellite') {
+    return new Cartesian3(0, -500_000, 500_000);
+  }
+  if (entityType === 'aircraft') {
+    return new Cartesian3(0, -30_000, 30_000);
+  }
+  if (entityType === 'ship') {
+    return new Cartesian3(0, -1_200, 2_100);
+  }
+  if (entityType === 'facility' || entityType === 'cctv') {
+    return new Cartesian3(0, -3_500, 5_500);
+  }
+  if (entityType === 'earthquake') {
+    return new Cartesian3(0, -40_000, 40_000);
+  }
+  return new Cartesian3(0, -200_000, 200_000);
 }
 
 const DEFAULT_LAYERS = {
@@ -243,8 +397,6 @@ function App() {
   // Viewer ref for reset-view functionality
   const viewerRef = useRef<CesiumViewer | null>(null);
 
-  // Boot sequence
-  const [booted, setBooted] = useState(false);
   const [globeInstanceKey, setGlobeInstanceKey] = useState(0);
   const [renderRecoveryNotice, setRenderRecoveryNotice] = useState<string | null>(null);
 
@@ -263,6 +415,8 @@ function App() {
 
   // State: flight sub-toggles
   const [showPaths, setShowPaths] = useState(false);
+  const [showPredictions, setShowPredictions] = useState(true);
+  const [airspaceRangeKm, setAirspaceRangeKm] = useState<AirspaceRangeKm>(DEFAULT_AIRSPACE_RANGE_KM);
   const [altitudeFilter, setAltitudeFilter] = useState<Record<AltitudeBand, boolean>>(DEFAULT_ALTITUDE_FILTER);
 
   // State: satellite sub-toggles
@@ -281,6 +435,8 @@ function App() {
   // State: tracked entity (lock view)
   const [trackedEntity, setTrackedEntity] = useState<TrackedEntityInfo | null>(null);
   const cctvTrackEntityRef = useRef<CesiumEntity | null>(null);
+  const ontologyTrackEntityRef = useRef<CesiumEntity | null>(null);
+  const ontologyTrackSourceIdRef = useRef<string | null>(null);
 
   /** Remove the temporary Cesium Entity used for CCTV lock-on */
   const cleanupCctvEntity = useCallback(() => {
@@ -293,13 +449,27 @@ function App() {
     }
   }, []);
 
+  const cleanupOntologyTrackEntity = useCallback(() => {
+    if (ontologyTrackEntityRef.current) {
+      const viewer = viewerRef.current;
+      if (viewer && !viewer.isDestroyed()) {
+        viewer.entities.remove(ontologyTrackEntityRef.current);
+      }
+      ontologyTrackEntityRef.current = null;
+      ontologyTrackSourceIdRef.current = null;
+    }
+  }, []);
+
   const handleTrackEntity = useCallback((info: TrackedEntityInfo | null) => {
     setTrackedEntity(info);
     // When tracking something else or clearing, clean up CCTV entity
     if (!info || info.entityType !== 'cctv') {
       cleanupCctvEntity();
     }
-  }, [cleanupCctvEntity]);
+    if (!info || info.id !== ontologyTrackSourceIdRef.current) {
+      cleanupOntologyTrackEntity();
+    }
+  }, [cleanupCctvEntity, cleanupOntologyTrackEntity]);
 
   const handleViewerReady = useCallback((viewer: CesiumViewer) => {
     viewerRef.current = viewer;
@@ -312,12 +482,14 @@ function App() {
 
     setTrackedEntity(null);
     setSelectedCameraId(null);
+    cleanupCctvEntity();
+    cleanupOntologyTrackEntity();
     setShaderMode('none');
     setMapTiles('osm');
     setLayers(RECOVERY_LAYERS);
     setRenderRecoveryNotice(`SAFE STARTUP MODE ACTIVE: ${message}`);
     setGlobeInstanceKey((value) => value + 1);
-  }, []);
+  }, [cleanupCctvEntity, cleanupOntologyTrackEntity]);
 
   const handleUnlockTrackedEntity = useCallback(() => {
     const viewer = viewerRef.current;
@@ -327,6 +499,53 @@ function App() {
     }
     setTrackedEntity(null);
     cleanupCctvEntity();
+    cleanupOntologyTrackEntity();
+  }, [cleanupCctvEntity, cleanupOntologyTrackEntity]);
+
+  const handleDesignateGroup = useCallback((group: DesignatableGroup) => {
+    const viewer = viewerRef.current;
+    const nextTrackedEntity: TrackedEntityInfo = {
+      id: group.id,
+      name: group.label,
+      entityType: 'group',
+      description: [
+        `<p><b>Group:</b> ${group.label}</p>`,
+        `<p><b>Type:</b> ${group.kind}</p>`,
+        `<p><b>Members:</b> ${group.memberCount}</p>`,
+        `<p><b>Confidence:</b> ${(group.confidence * 100).toFixed(0)}%</p>`,
+      ].join(''),
+    };
+
+    cleanupCctvEntity();
+    setTrackedEntity(nextTrackedEntity);
+
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
+
+    const targetEntity = findViewerEntity(viewer, group.id);
+    if (targetEntity) {
+      targetEntity.viewFrom = new ConstantProperty(new Cartesian3(0, -160_000, 160_000)) as unknown as never;
+      viewer.selectedEntity = targetEntity;
+      viewer.trackedEntity = targetEntity;
+      return;
+    }
+
+    viewer.trackedEntity = undefined;
+    viewer.selectedEntity = undefined;
+    viewer.camera.flyTo({
+      destination: Cartesian3.fromDegrees(
+        group.longitude,
+        group.latitude,
+        Math.max(220_000, group.altitude + 120_000),
+      ),
+      orientation: {
+        heading: CesiumMath.toRadians(0),
+        pitch: CesiumMath.toRadians(-70),
+        roll: 0,
+      },
+      duration: 1.8,
+    });
   }, [cleanupCctvEntity]);
 
   useEffect(() => {
@@ -345,6 +564,8 @@ function App() {
     if (!viewer || viewer.isDestroyed()) return;
     viewer.trackedEntity = undefined;
     setTrackedEntity(null);
+    cleanupCctvEntity();
+    cleanupOntologyTrackEntity();
     viewer.camera.flyTo({
       destination: Cartesian3.fromDegrees(151.2093, -33.8688, 20_000_000),
       orientation: {
@@ -354,7 +575,7 @@ function App() {
       },
       duration: 2,
     });
-  }, []);
+  }, [cleanupCctvEntity, cleanupOntologyTrackEntity]);
 
   const renderBudget = useMemo(
     () => buildRenderBudget(renderCamera, Boolean(trackedEntity)),
@@ -372,7 +593,7 @@ function App() {
     queryCamera.altitude,
     !!trackedEntity,
   );
-  const { roads: trafficRoads, vehicles: trafficVehicles } = useTraffic(
+  const { roads: trafficRoads, vehicles: trafficVehicles, loading: trafficLoading } = useTraffic(
     layers.traffic,
     queryCamera.latitude,
     queryCamera.longitude,
@@ -466,6 +687,22 @@ function App() {
   const earthquakes = useMemo(() => compactSanitized(rawEarthquakes, sanitizeEarthquake), [rawEarthquakes]);
   const cctvCameras = useMemo(() => compactSanitized(rawCctvCameras, sanitizeCamera), [rawCctvCameras]);
   const ships = useMemo(() => compactSanitized(rawShips, sanitizeShip), [rawShips]);
+  const ontologyWorkbench = useOntologyWorkbench(renderCamera, trackedEntity?.id ?? null);
+  const setOntologySelectedEntityId = ontologyWorkbench.setSelectedEntityId;
+
+  useOntologySync({
+    flights,
+    ships,
+    satellites,
+    cameras: cctvCameras,
+    earthquakes,
+    roads: trafficRoads,
+  });
+
+  const ontologyRenderableEntities = useMemo(
+    () => ontologyWorkbench.mapEntities.filter(isOntologyMapRenderable),
+    [ontologyWorkbench.mapEntities],
+  );
 
   useEffect(() => {
     groupController.pushSources({
@@ -481,10 +718,33 @@ function App() {
   }, [trackedEntity]);
 
   useEffect(() => {
+    if (trackedEntity?.id) {
+      setOntologySelectedEntityId(trackedEntity.id);
+    }
+  }, [setOntologySelectedEntityId, trackedEntity?.id]);
+
+  useEffect(() => {
     groupController.setCameraState(renderCamera);
   }, [renderCamera]);
 
   const visualIntelligence = useVisualIntelligence();
+  const pinnedGroupId = trackedEntity?.entityType === 'group' ? trackedEntity.id : null;
+  const visibleTieredGroups = useMemo(
+    () => filterTieredGroupsByRange(visualIntelligence.tieredGroups, renderCamera, airspaceRangeKm, pinnedGroupId),
+    [airspaceRangeKm, pinnedGroupId, renderCamera, visualIntelligence.tieredGroups],
+  );
+  const visibleSelectionContext = useMemo(
+    () => mergeOntologySelectionContext(
+      stripSelectionPredictions(visualIntelligence.selectionContext, showPredictions),
+      trackedEntity,
+      ontologyWorkbench.trackedEntityDetail,
+    ),
+    [ontologyWorkbench.trackedEntityDetail, showPredictions, trackedEntity, visualIntelligence.selectionContext],
+  );
+  const designatableGroups = useMemo(
+    () => buildDesignatableGroups(visibleTieredGroups, renderCamera),
+    [renderCamera, visibleTieredGroups],
+  );
 
   const flightEntries = useMemo<RenderEntry<Flight>[]>(
     () => flights.map((flight) => ({
@@ -542,8 +802,8 @@ function App() {
   const shipIndex = useMemo(() => new GridSpatialIndex(shipEntries, 4), [shipEntries]);
 
   const selectionPriorityIds = useMemo(
-    () => deriveRenderPriorityIds(visualIntelligence.selectionContext),
-    [visualIntelligence.selectionContext],
+    () => deriveRenderPriorityIds(visibleSelectionContext),
+    [visibleSelectionContext],
   );
 
   const globeFlights = useMemo(
@@ -782,6 +1042,49 @@ function App() {
     handleCctvLockOn(camData);
   }, [handleCctvLockOn]);
 
+  const handleTrackOntologyEntity = useCallback((entity: OntologyEntity) => {
+    const viewer = viewerRef.current;
+    const nextTrackedEntity = buildOntologyTrackedEntityInfo(entity);
+    const focus = getOntologyEntityFocus(entity);
+
+    setTrackedEntity(nextTrackedEntity);
+    setOntologySelectedEntityId(entity.id);
+    cleanupCctvEntity();
+    cleanupOntologyTrackEntity();
+
+    if (nextTrackedEntity.entityType === 'cctv' && entity.id.startsWith('cctv-')) {
+      setSelectedCameraId(entity.id.slice(5));
+    }
+
+    if (!viewer || viewer.isDestroyed() || !focus) {
+      return;
+    }
+
+    const existing = findViewerEntity(viewer, entity.id);
+    if (existing) {
+      existing.viewFrom = new ConstantProperty(getTrackedViewOffset(nextTrackedEntity.entityType)) as unknown as never;
+      viewer.selectedEntity = existing;
+      viewer.trackedEntity = existing;
+      return;
+    }
+
+    const proxy = viewer.entities.add({
+      id: `track-proxy-${entity.id}`,
+      name: entity.label,
+      position: Cartesian3.fromDegrees(focus.longitude, focus.latitude, Math.max(0, focus.altitude)),
+      description: nextTrackedEntity.description,
+      point: {
+        pixelSize: 1,
+        color: Color.TRANSPARENT,
+      },
+    });
+    proxy.viewFrom = new ConstantProperty(getTrackedViewOffset(nextTrackedEntity.entityType)) as unknown as never;
+    ontologyTrackEntityRef.current = proxy;
+    ontologyTrackSourceIdRef.current = entity.id;
+    viewer.selectedEntity = proxy;
+    viewer.trackedEntity = proxy;
+  }, [cleanupCctvEntity, cleanupOntologyTrackEntity, setOntologySelectedEntityId]);
+
   const handleAltitudeToggle = useCallback((band: AltitudeBand) => {
     audio.play('click');
     setAltitudeFilter((prev) => ({ ...prev, [band]: !prev[band] }));
@@ -793,20 +1096,7 @@ function App() {
   }, [audio]);
 
   // Stable altitude filter ref to avoid unnecessary re-renders
-
-  // Boot complete callback — starts ambient drone
-  const handleBootComplete = useCallback(() => {
-    audio.play('bootComplete');
-    audio.startAmbient();
-    setBooted(true);
-  }, [audio]);
-
   const opticsOverlayEnabled = shaderMode !== 'none';
-
-  // Splash screen
-  if (!booted) {
-    return <SplashScreen onComplete={handleBootComplete} audio={audio} />;
-  }
 
   return (
     <div data-testid="app-root" className={`w-screen h-screen bg-wv-black overflow-hidden ${opticsOverlayEnabled ? 'scanline-overlay' : ''}`}>
@@ -826,9 +1116,11 @@ function App() {
         <EarthquakeLayer earthquakes={globeEarthquakes} visible={layers.earthquakes} isTracking={!!trackedEntity} />
         <SatelliteLayer satellites={globeSatellites} visible={layers.satellites} showPaths={showSatPaths} categoryFilter={satCategoryFilter} isTracking={!!trackedEntity} />
         <FlightLayer
+          airspaceRangeKm={airspaceRangeKm}
           flights={globeFlights}
           visible={layers.flights}
           showPaths={showPaths}
+          showPredictions={showPredictions}
           altitudeFilter={altitudeFilter}
           isTracking={!!trackedEntity}
         />
@@ -839,6 +1131,10 @@ function App() {
           showRoads={true}
           showVehicles={true}
           congestionMode={false}
+        />
+        <OntologyLayer
+          entities={ontologyRenderableEntities}
+          visible={ontologyWorkbench.activeLayerIds.length > 0}
         />
         <CCTVLayer
           cameras={globeCameras}
@@ -851,8 +1147,8 @@ function App() {
           isTracking={!!trackedEntity}
         />
         <VisualIntelligenceLayer
-          tieredGroups={visualIntelligence.tieredGroups}
-          selectionContext={visualIntelligence.selectionContext}
+          tieredGroups={visibleTieredGroups}
+          selectionContext={visibleSelectionContext}
           cameraAltitude={renderCamera.altitude}
         />
       </GlobeViewer>
@@ -867,25 +1163,62 @@ function App() {
       <Crosshair />
       <TrackedEntityPanel
         trackedEntity={trackedEntity}
+        ontologyEntity={ontologyWorkbench.trackedEntityDetail}
         onUnlock={handleUnlockTrackedEntity}
         isMobile={isMobile}
+      />
+      <OntologyWorkbench
+        isMobile={isMobile}
+        layers={ontologyWorkbench.layers}
+        activeLayerIds={ontologyWorkbench.activeLayerIds}
+        onToggleLayer={(layerId) => {
+          audio.play('click');
+          ontologyWorkbench.setActiveLayerIds((current) =>
+            current.includes(layerId)
+              ? current.filter((candidate) => candidate !== layerId)
+              : [...current, layerId],
+          );
+        }}
+        filters={ontologyWorkbench.filters}
+        onFiltersChange={ontologyWorkbench.setFilters}
+        searchQuery={ontologyWorkbench.searchQuery}
+        onSearchQueryChange={ontologyWorkbench.setSearchQuery}
+        searchResults={ontologyWorkbench.searchResults}
+        selectedEntity={ontologyWorkbench.selectedEntity}
+        selectedEvidence={ontologyWorkbench.selectedEvidence}
+        onSelectEntity={ontologyWorkbench.setSelectedEntityId}
+        onTrackEntity={handleTrackOntologyEntity}
+        presets={ontologyWorkbench.presets}
+        onApplyPreset={ontologyWorkbench.applyPreset}
+        onSavePreset={async (name, description) => {
+          await ontologyWorkbench.saveCurrentPreset(name, description);
+        }}
+        loadingLayers={ontologyWorkbench.loadingLayers}
+        loadingSelected={ontologyWorkbench.loadingSelected}
       />
       <OperationsPanel
         shaderMode={shaderMode}
         onShaderChange={(mode) => { audio.play('shaderSwitch'); setShaderMode(mode); }}
         layers={layers}
-        layerLoading={{ ships: shipsLoading }}
+        layerLoading={{ ships: shipsLoading, traffic: trafficLoading }}
         onLayerToggle={handleLayerToggle}
         mapTiles={mapTiles}
         onMapTilesChange={(t) => { audio.play('click'); setMapTiles(t); }}
         showPaths={showPaths}
         onShowPathsToggle={() => { audio.play('click'); setShowPaths((p) => !p); }}
+        showPredictions={showPredictions}
+        onShowPredictionsToggle={() => { audio.play('click'); setShowPredictions((value) => !value); }}
+        airspaceRangeKm={airspaceRangeKm}
+        onAirspaceRangeChange={(range) => { audio.play('click'); setAirspaceRangeKm(range); }}
         altitudeFilter={altitudeFilter}
         onAltitudeToggle={handleAltitudeToggle}
         showSatPaths={showSatPaths}
         onShowSatPathsToggle={() => { audio.play('click'); setShowSatPaths((p) => !p); }}
         satCategoryFilter={satCategoryFilter}
         onSatCategoryToggle={handleSatCategoryToggle}
+        designatableGroups={designatableGroups}
+        selectedGroupId={trackedEntity?.entityType === 'group' ? trackedEntity.id : null}
+        onGroupDesignate={(group) => { audio.play('click'); handleDesignateGroup(group); }}
         onResetView={() => { audio.play('click'); handleResetView(); }}
         onLocateMe={() => { audio.play('click'); geoLocate(); }}
         geoStatus={geoStatus}
@@ -918,6 +1251,8 @@ function App() {
           earthquakes: earthquakes.length,
           cctv: cctvTotal,
           ships: ships.length,
+          traffic: trafficRoads.length,
+          ontology: ontologyWorkbench.mapEntities.length,
         }}
       />
       <AudioToggle muted={audio.muted} onToggle={audio.toggleMute} isMobile={isMobile} />

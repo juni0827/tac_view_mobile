@@ -75,6 +75,11 @@ describe('server contracts', () => {
     expect(response.status).toBe(200);
     expect(response.body.status).toBe('ok');
     expect(response.body.runtime.authTokenEnabled).toBe(true);
+    expect(response.body.runtime.ontology).toMatchObject({
+      overpassUrlCount: expect.any(Number),
+      wikidataEnabled: expect.any(Boolean),
+      geonamesEnabled: expect.any(Boolean),
+    });
   });
 
   it('normalizes geolocation responses', async () => {
@@ -332,5 +337,120 @@ describe('server contracts', () => {
       mmsi: '123456789',
       destination: 'BUSAN',
     });
+  });
+
+  it('syncs ontology snapshots and exposes search, detail, evidence, and relations APIs', async () => {
+    const syncResponse = await request(app)
+      .post('/api/ontology/sync')
+      .set(authHeader)
+      .send({
+        flights: [
+          {
+            icao24: 'abc123',
+            callsign: 'TAC101',
+            registration: 'N101TV',
+            aircraftType: 'A321',
+            latitude: 37.62,
+            longitude: -122.38,
+            altitude: 10800,
+            velocityKnots: 420,
+            heading: 92,
+            originAirport: 'SFO',
+            destAirport: 'LAX',
+            airline: 'Tac View Air',
+            operator: 'Tac View Air',
+          },
+          {
+            icao24: 'def456',
+            callsign: 'TAC202',
+            registration: 'N202TV',
+            aircraftType: 'A321',
+            latitude: 37.66,
+            longitude: -122.33,
+            altitude: 10950,
+            velocityKnots: 418,
+            heading: 94,
+            originAirport: 'SFO',
+            destAirport: 'LAX',
+            airline: 'Tac View Air',
+            operator: 'Tac View Air',
+          },
+        ],
+        ships: [],
+        satellites: [],
+        cameras: [],
+        earthquakes: [],
+        roads: [],
+      });
+
+    expect(syncResponse.status).toBe(200);
+    expect(syncResponse.body.ok).toBe(true);
+    expect(syncResponse.body.recordCount).toBe(2);
+
+    const searchResponse = await request(app)
+      .get('/api/ontology/search?q=TAC101')
+      .set(authHeader);
+    expect(searchResponse.status).toBe(200);
+    expect(searchResponse.body.items[0]).toMatchObject({
+      id: 'flight-abc123',
+      canonicalType: 'aircraft',
+    });
+
+    const detailResponse = await request(app)
+      .get('/api/ontology/entities/flight-abc123')
+      .set(authHeader);
+    expect(detailResponse.status).toBe(200);
+    expect(detailResponse.body.observations.length).toBeGreaterThan(0);
+
+    const evidenceResponse = await request(app)
+      .get('/api/ontology/entities/flight-abc123/evidence?page=1&pageSize=10')
+      .set(authHeader);
+    expect(evidenceResponse.status).toBe(200);
+    expect(evidenceResponse.body.items.length).toBeGreaterThan(0);
+
+    const relationsResponse = await request(app)
+      .get('/api/ontology/relations?entityId=flight-abc123')
+      .set(authHeader);
+    expect(relationsResponse.status).toBe(200);
+    expect(relationsResponse.body.items.some((item: { ruleName: string }) => item.ruleName === 'same_route_nearby')).toBe(true);
+  });
+
+  it('saves and lists ontology presets', async () => {
+    const createResponse = await request(app)
+      .post('/api/ontology/presets')
+      .set(authHeader)
+      .send({
+        name: 'Harbor Watch',
+        description: 'Ports and sensors around current AOI',
+        filters: {
+          canonicalTypes: ['port', 'sensor'],
+          country: 'US',
+          minConfidence: 0.6,
+        },
+        layerIds: ['infra-ports', 'dynamic-sensors'],
+      });
+
+    expect(createResponse.status).toBe(201);
+    expect(createResponse.body.name).toBe('Harbor Watch');
+
+    const listResponse = await request(app)
+      .get('/api/ontology/presets')
+      .set(authHeader);
+    expect(listResponse.status).toBe(200);
+    expect(listResponse.body.items.some((item: { name: string }) => item.name === 'Harbor Watch')).toBe(true);
+  });
+
+  it('lists ontology connector configuration and runtime state', async () => {
+    const response = await request(app)
+      .get('/api/ontology/connectors')
+      .set(authHeader);
+
+    expect(response.status).toBe(200);
+    expect(response.body.configured).toMatchObject({
+      overpassUrls: expect.any(Array),
+      wikidataEnabled: expect.any(Boolean),
+      geonamesEnabled: expect.any(Boolean),
+    });
+    expect(Array.isArray(response.body.items)).toBe(true);
   });
 });

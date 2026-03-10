@@ -27,18 +27,30 @@ if ($process.ExitCode -ne 0) {
   throw "Windows Tauri build failed with exit code $($process.ExitCode)."
 }
 
-$releaseRoot = Join-Path $repoRoot 'src-tauri\target\x86_64-pc-windows-msvc\release'
-$bundleRoot = Join-Path $releaseRoot 'bundle\nsis'
+Push-Location $repoRoot
+$cargoTargetRoot = (& node -e "import('./scripts/tauri-runner.mjs').then((m) => console.log(m.getScopedCargoTargetDir()))" |
+  Select-Object -Last 1).Trim()
+Pop-Location
+
+if (-not $cargoTargetRoot) {
+  throw 'Unable to determine scoped Tauri cargo target directory.'
+}
+
+$releaseRoot = Join-Path $cargoTargetRoot 'x86_64-pc-windows-msvc\release'
+$bundleRoot = Join-Path $releaseRoot 'bundle'
 $portableRoot = Join-Path $repoRoot 'TAC_VIEW'
 $portableResources = Join-Path $portableRoot 'resources'
-$rootInstallerPath = Join-Path $repoRoot 'TAC_VIEW_setup.exe'
 
 $appExe = Join-Path $releaseRoot 'tac_view.exe'
 $sidecarExe = Join-Path $releaseRoot 'tac_view-sidecar.exe'
 $resourcesDir = Join-Path $releaseRoot 'resources'
-$installer = Get-ChildItem $bundleRoot -Filter '*setup.exe' |
+$nsisInstaller = Get-ChildItem (Join-Path $bundleRoot 'nsis') -Filter '*setup.exe' -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending |
   Select-Object -First 1
+$msiInstaller = Get-ChildItem (Join-Path $bundleRoot 'msi') -Filter '*.msi' -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+$installer = if ($nsisInstaller) { $nsisInstaller } else { $msiInstaller }
 
 foreach ($requiredPath in @($appExe, $sidecarExe, $resourcesDir)) {
   if (-not (Test-Path $requiredPath)) {
@@ -58,6 +70,9 @@ New-Item -ItemType Directory -Path $portableRoot | Out-Null
 Copy-Item $appExe (Join-Path $portableRoot 'tac_view.exe') -Force
 Copy-Item $sidecarExe (Join-Path $portableRoot 'tac_view-sidecar.exe') -Force
 Copy-Item $resourcesDir $portableResources -Recurse -Force
+
+$installerExtension = $installer.Extension
+$rootInstallerPath = Join-Path $repoRoot "TAC_VIEW_setup$installerExtension"
 Copy-Item $installer.FullName $rootInstallerPath -Force
 
 Write-Host "[desktop-build] Portable app copied to $portableRoot"

@@ -34,12 +34,18 @@ describe('runtime config', () => {
       },
       server: {
         openskyClientId: 'file-opensky-id',
+        ontologyOverpassUrls: ['https://overpass.example/api'],
+        wikidataEntityDataUrl: 'https://wikidata.example/entity',
+        wikidataUserAgent: 'TacViewTest/1.0',
+        geonamesUsername: 'file-geonames-user',
+        geonamesApiUrl: 'https://geonames.example',
       },
     }), 'utf8');
 
     process.env.TAC_VIEW_CONFIG_PATH = configPath;
     process.env.TAC_VIEW_AUTH_TOKEN = 'desktop-token';
     process.env.VITE_GOOGLE_API_KEY = 'env-google';
+    process.env.GEONAMES_USERNAME = 'env-geonames-user';
 
     const runtime = await loadRuntimeConfig();
 
@@ -54,6 +60,16 @@ describe('runtime config', () => {
 
     applyRuntimeConfigToEnv(runtime);
     expect(process.env.OPENSKY_CLIENT_ID).toBe('file-opensky-id');
+    expect(runtime.server.ontologyOverpassUrls).toEqual(['https://overpass.example/api']);
+    expect(runtime.server.wikidataEntityDataUrl).toBe('https://wikidata.example/entity');
+    expect(runtime.server.wikidataUserAgent).toBe('TacViewTest/1.0');
+    expect(runtime.server.geonamesUsername).toBe('env-geonames-user');
+    expect(runtime.server.geonamesApiUrl).toBe('https://geonames.example');
+    expect(process.env.ONTOLOGY_OVERPASS_URLS).toBe('https://overpass.example/api');
+    expect(process.env.WIKIDATA_ENTITY_DATA_URL).toBe('https://wikidata.example/entity');
+    expect(process.env.WIKIDATA_USER_AGENT).toBe('TacViewTest/1.0');
+    expect(process.env.GEONAMES_USERNAME).toBe('env-geonames-user');
+    expect(process.env.GEONAMES_API_URL).toBe('https://geonames.example');
 
     await rm(tempDir, { recursive: true, force: true });
   });

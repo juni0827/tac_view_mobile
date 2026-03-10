@@ -36,7 +36,7 @@ export interface DestinationCandidate {
 export interface RelatedEntitySummary {
   id: string;
   name: string;
-  entityType: 'aircraft' | 'ship' | 'satellite' | 'facility' | 'group';
+  entityType: 'aircraft' | 'ship' | 'satellite' | 'earthquake' | 'cctv' | 'facility' | 'group';
   latitude: number;
   longitude: number;
   altitude: number;

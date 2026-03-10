@@ -16,6 +16,7 @@ import {
   LabelCollection,
   LabelStyle,
   Math as CesiumMath,
+  Material,
   NearFarScalar,
   Polyline,
   PolylineCollection,
@@ -35,6 +36,10 @@ const EllipsoidalOccluder = (Cesium as unknown as {
 
 const SAT_COLOR_ISS = Color.fromCssColorString('#00D4FF');
 const SAT_COLOR_DEFAULT = Color.fromCssColorString('#39FF14');
+
+function createPolylineMaterial(color: Color) {
+  return Material.fromType('Color', { color });
+}
 
 export type SatelliteCategory = 'iss' | 'other';
 
@@ -327,7 +332,7 @@ export default function SatelliteLayer({
           primitiveRefs.orbit = collections.orbits.add({
             positions: orbitPositions,
             width: isIss ? 3 : 2,
-            material: color.withAlpha(isIss ? 0.7 : 0.4),
+            material: createPolylineMaterial(color.withAlpha(isIss ? 0.7 : 0.4)),
           });
         }
 
@@ -338,7 +343,7 @@ export default function SatelliteLayer({
           primitiveRefs.groundTrack = collections.groundTracks.add({
             positions: groundTrackPositions,
             width: isIss ? 2 : 1,
-            material: color.withAlpha(isIss ? 0.35 : 0.15),
+            material: createPolylineMaterial(color.withAlpha(isIss ? 0.35 : 0.15)),
           });
         }
 
@@ -349,7 +354,7 @@ export default function SatelliteLayer({
           primitiveRefs.nadir = collections.nadirs.add({
             positions: nadirPositions,
             width: 1,
-            material: color.withAlpha(0.2),
+            material: createPolylineMaterial(color.withAlpha(0.2)),
           });
         }
       } else {

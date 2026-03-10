@@ -401,6 +401,10 @@ function syncSelection(
       nextIds.add(id);
       const color = entitySummary.entityType === 'satellite'
         ? Color.fromCssColorString('#39FF14')
+        : entitySummary.entityType === 'earthquake'
+          ? Color.fromCssColorString('#FF9500')
+          : entitySummary.entityType === 'cctv'
+            ? Color.fromCssColorString('#FF3B30')
         : entitySummary.entityType === 'facility'
           ? Color.fromCssColorString('#FFD60A')
           : entitySummary.entityType === 'group'

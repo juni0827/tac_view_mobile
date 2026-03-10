@@ -7,12 +7,39 @@ function readString(value) {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : '';
 }
 
+function readStringArray(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => readString(entry))
+    .filter(Boolean);
+}
+
 function firstDefined(...values) {
   for (const value of values) {
     const normalized = readString(value);
     if (normalized) return normalized;
   }
   return '';
+}
+
+function firstDefinedArray(...values) {
+  for (const value of values) {
+    const normalized = readStringArray(value);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+  return [];
+}
+
+function parseEnvStringArray(value) {
+  return readString(value)
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function parseOptionalJson(text, sourceLabel) {
@@ -70,6 +97,11 @@ function normalizeConfigShape(config) {
       openskyClientSecret: readString(server.openskyClientSecret),
       aisstreamApiKey: readString(server.aisstreamApiKey),
       nswTransportApiKey: readString(server.nswTransportApiKey),
+      ontologyOverpassUrls: readStringArray(server.ontologyOverpassUrls),
+      wikidataEntityDataUrl: readString(server.wikidataEntityDataUrl),
+      wikidataUserAgent: readString(server.wikidataUserAgent),
+      geonamesUsername: readString(server.geonamesUsername),
+      geonamesApiUrl: readString(server.geonamesApiUrl),
     },
   };
 }
@@ -86,6 +118,11 @@ function readEnvConfig(env) {
       openskyClientSecret: firstDefined(env.OPENSKY_CLIENT_SECRET),
       aisstreamApiKey: firstDefined(env.AISSTREAM_API_KEY),
       nswTransportApiKey: firstDefined(env.NSW_TRANSPORT_API_KEY),
+      ontologyOverpassUrls: parseEnvStringArray(env.ONTOLOGY_OVERPASS_URLS),
+      wikidataEntityDataUrl: firstDefined(env.WIKIDATA_ENTITY_DATA_URL),
+      wikidataUserAgent: firstDefined(env.WIKIDATA_USER_AGENT),
+      geonamesUsername: firstDefined(env.GEONAMES_USERNAME),
+      geonamesApiUrl: firstDefined(env.GEONAMES_API_URL),
     },
   };
 }
@@ -102,6 +139,11 @@ function mergeRuntimeConfig(fileConfig, envConfig) {
       openskyClientSecret: firstDefined(envConfig.server.openskyClientSecret, fileConfig.server.openskyClientSecret),
       aisstreamApiKey: firstDefined(envConfig.server.aisstreamApiKey, fileConfig.server.aisstreamApiKey),
       nswTransportApiKey: firstDefined(envConfig.server.nswTransportApiKey, fileConfig.server.nswTransportApiKey),
+      ontologyOverpassUrls: firstDefinedArray(envConfig.server.ontologyOverpassUrls, fileConfig.server.ontologyOverpassUrls),
+      wikidataEntityDataUrl: firstDefined(envConfig.server.wikidataEntityDataUrl, fileConfig.server.wikidataEntityDataUrl),
+      wikidataUserAgent: firstDefined(envConfig.server.wikidataUserAgent, fileConfig.server.wikidataUserAgent),
+      geonamesUsername: firstDefined(envConfig.server.geonamesUsername, fileConfig.server.geonamesUsername),
+      geonamesApiUrl: firstDefined(envConfig.server.geonamesApiUrl, fileConfig.server.geonamesApiUrl),
     },
   };
 }
@@ -140,6 +182,14 @@ export function applyRuntimeConfigToEnv(runtimeConfig) {
   process.env.OPENSKY_CLIENT_SECRET = firstDefined(process.env.OPENSKY_CLIENT_SECRET, runtimeConfig.server.openskyClientSecret);
   process.env.AISSTREAM_API_KEY = firstDefined(process.env.AISSTREAM_API_KEY, runtimeConfig.server.aisstreamApiKey);
   process.env.NSW_TRANSPORT_API_KEY = firstDefined(process.env.NSW_TRANSPORT_API_KEY, runtimeConfig.server.nswTransportApiKey);
+  process.env.ONTOLOGY_OVERPASS_URLS = firstDefined(
+    process.env.ONTOLOGY_OVERPASS_URLS,
+    runtimeConfig.server.ontologyOverpassUrls.join(','),
+  );
+  process.env.WIKIDATA_ENTITY_DATA_URL = firstDefined(process.env.WIKIDATA_ENTITY_DATA_URL, runtimeConfig.server.wikidataEntityDataUrl);
+  process.env.WIKIDATA_USER_AGENT = firstDefined(process.env.WIKIDATA_USER_AGENT, runtimeConfig.server.wikidataUserAgent);
+  process.env.GEONAMES_USERNAME = firstDefined(process.env.GEONAMES_USERNAME, runtimeConfig.server.geonamesUsername);
+  process.env.GEONAMES_API_URL = firstDefined(process.env.GEONAMES_API_URL, runtimeConfig.server.geonamesApiUrl);
 }
 
 export function getClientRuntimeConfig(runtimeConfig) {

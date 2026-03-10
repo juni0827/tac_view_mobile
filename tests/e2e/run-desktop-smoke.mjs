@@ -56,6 +56,13 @@ async function clickByLabel(driver, label) {
   await element.click();
 }
 
+async function assertAppRootPresent(driver, context) {
+  const appRoots = await driver.findElements(By.css('[data-testid="app-root"]'));
+  if (appRoots.length === 0) {
+    throw new Error(`${context}: TAC_VIEW app root disappeared`);
+  }
+}
+
 async function cleanupDesktopProcesses() {
   if (process.platform !== 'win32') {
     return;
@@ -192,6 +199,9 @@ async function main() {
     await clickByLabel(driver, 'CCTV FEEDS');
     await clickByLabel(driver, 'NAVAL / AIS');
     await delay(1500);
+    await clickByLabel(driver, 'ORBIT PATHS');
+    await delay(1500);
+    await assertAppRootPresent(driver, 'after ORBIT PATHS');
 
     const performanceSnapshot = await driver.executeScript('return window.__TAC_VIEW_PERFORMANCE__ || null;');
     if (!performanceSnapshot || typeof performanceSnapshot.fps !== 'number') {
