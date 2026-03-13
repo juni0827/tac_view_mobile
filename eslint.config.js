@@ -7,13 +7,13 @@ import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
   globalIgnores([
-    'dist',
-    '.sidecar-build',
-    '.tauri-target',
+    'RUN',
+    '.build-cache',
     '.playwright-cli',
     '.tmp-runtime-snapshots',
-    'TAC_VIEW',
-    'src-tauri/target',
+    'app/desktop/target',
+    'app/desktop/binaries',
+    'app/desktop/gen',
   ]),
   {
     files: ['**/*.{ts,tsx}'],

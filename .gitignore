@@ -8,20 +8,17 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+RUN/
 dist/
 dist-ssr
 output/
 *.local
-.sidecar-build/
-.tauri-target/
-.tac_view-cache/
+.build-cache/
 .tmp-runtime-snapshots/
 .playwright-cli/
-src-tauri/target/
-src-tauri/binaries/
-TAC_VIEW/
-TAC_VIEW_setup.exe
-src-tauri/gen/
+app/desktop/target/
+app/desktop/binaries/
+app/desktop/gen/
 tac_view-dev.stdout.log
 tac_view-dev.stderr.log
 tauri-dev.stdout.log

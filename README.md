@@ -12,11 +12,11 @@ TAC_VIEW is a desktop-first tactical intelligence globe built with `Tauri`, `Rea
 
 ## Runtime Model
 
-- The desktop shell launches a packaged sidecar binary from `src-tauri/binaries/`.
+- The desktop shell launches a packaged sidecar binary from `app/desktop/binaries/`.
 - The sidecar exposes the existing `/api/*` contract on a local port.
 - The renderer gets runtime bootstrap data from Tauri instead of hard-coded build-time env values.
 - Desktop config lives at `appData/tac_view/config.json`.
-- The example config file is `config/tac_view.config.example.json`.
+- The example config file is `ops/config/tac_view.config.example.json`.
 
 ## Main Capabilities
 
@@ -51,7 +51,7 @@ npm install
 
 ### Configure
 
-Copy `config/tac_view.config.example.json` into your runtime config location and fill in the keys you actually use.
+Copy `ops/config/tac_view.config.example.json` into your runtime config location and fill in the keys you actually use.
 Keep the example file as a placeholder template only; do not commit real API keys into it.
 
 Relevant keys:
@@ -62,6 +62,10 @@ Relevant keys:
 - `server.openskyClientSecret`
 - `server.aisstreamApiKey`
 - `server.nswTransportApiKey`
+- `server.acledAccessKey`
+- `server.acledEmail`
+- `server.reliefwebAppName`
+- `server.newsApiKey`
 
 The packaged desktop flow reads runtime keys from `appData/tac_view/config.json`.
 
@@ -77,8 +81,9 @@ npm run tauri:build:win
 
 After the build finishes, the top-level outputs are:
 
-- `TAC_VIEW/` for the portable desktop run set
-- `TAC_VIEW_setup.exe` for the Windows installer
+- `RUN/tac_view.exe` for the portable desktop app
+- `RUN/TAC_VIEW_setup.exe` for the Windows installer
+- `RUN_TAC_VIEW.cmd` for a root-level launcher shortcut
 
 ### Build
 
@@ -105,20 +110,15 @@ Unit coverage includes the tiered group engine, render-budget controller, and re
 ## Repository Layout
 
 ```text
-config/       Runtime config examples
-scripts/      Sidecar build and desktop smoke helpers
-server/       Express sidecar, runtime config, snapshot storage
-src/          React/Cesium application
-src/intelligence/ Tiered grouping engine, worker bridge, selection context
-src/lib/      Render safety, budget, priority query, performance stores
-src-tauri/    Tauri shell and desktop integration
-tests/        Unit, contract, and desktop smoke coverage
+app/          Frontend, sidecar, and Tauri desktop source
+ops/          Runtime config examples, scripts, and tests
+RUN/          Web build output and desktop executables/installers
 ```
 
 ## Notes
 
 - This repository is now desktop-first. Old Vercel/serverless deployment artifacts have been removed.
 - Standalone local-web development entry points have been removed. The supported runtime is the packaged desktop app plus its local sidecar API.
-- Build output such as `dist/`, `.sidecar-build/`, `src-tauri/target/`, and packaged binaries is treated as generated state.
+- Build output such as `RUN/`, `.build-cache/`, `app/desktop/target/`, and packaged binaries is treated as generated state.
 - Temporary runtime snapshots and Playwright CLI logs are treated as generated local artifacts.
 - Missing API keys degrade features selectively rather than preventing the app from booting.

@@ -1,0 +1,26 @@
+{
+  "client": {
+    "googleApiKey": "",
+    "cesiumIonToken": ""
+  },
+  "server": {
+    "googleMapsApiKey": "",
+    "openskyClientId": "",
+    "openskyClientSecret": "",
+    "aisstreamApiKey": "fb0dd075dd270bf5623dea6d00805cd355eef01d",
+    "nswTransportApiKey": "",
+    "acledAccessKey": "",
+    "acledEmail": "",
+    "reliefwebAppName": "",
+    "newsApiKey": "",
+    "ontologyOverpassUrls": [
+      "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.private.coffee/api/interpreter"
+    ],
+    "wikidataEntityDataUrl": "https://www.wikidata.org/wiki/Special:EntityData",
+    "wikidataUserAgent": "TAC_VIEW/1.0",
+    "geonamesUsername": "",
+    "geonamesApiUrl": "https://secure.geonames.org"
+  }
+}

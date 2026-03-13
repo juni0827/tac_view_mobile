@@ -5,13 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "tsc -b && vite build",
-    "build:sidecar": "node scripts/build_sidecar.mjs",
+    "build:sidecar": "node ops/scripts/build_sidecar.mjs",
     "lint": "eslint .",
-    "test:unit": "vitest run tests/unit",
-    "test:contracts": "vitest run tests/contracts",
-    "test:e2e:desktop": "node tests/e2e/run-desktop-smoke.mjs",
-    "test:smoke:desktop": "node tests/e2e/run-desktop-smoke.mjs",
-    "tauri:build:win": "powershell -ExecutionPolicy Bypass -File scripts/tac_view_build_win.ps1"
+    "test:unit": "vitest run ops/tests/unit",
+    "test:contracts": "vitest run ops/tests/contracts",
+    "test:e2e:desktop": "node ops/tests/e2e/run-desktop-smoke.mjs",
+    "test:smoke:desktop": "node ops/tests/e2e/run-desktop-smoke.mjs",
+    "tauri:build:win": "powershell -ExecutionPolicy Bypass -File ops/scripts/tac_view_build_win.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",

@@ -1,0 +1,42 @@
+{
+  "$schema": "../../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "TAC_VIEW",
+  "version": "0.1.0",
+  "identifier": "com.tacview.desktop",
+  "build": {
+    "beforeBuildCommand": "npm run build:sidecar && npm run build",
+    "frontendDist": "../../RUN/web"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "TAC_VIEW",
+        "width": 1600,
+        "height": 960,
+        "minWidth": 1200,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "resources": [
+      "binaries/better_sqlite3*.node"
+    ],
+    "externalBin": [
+      "binaries/tac_view-sidecar"
+    ]
+  }
+}
